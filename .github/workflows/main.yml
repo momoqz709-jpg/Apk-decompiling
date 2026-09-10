@@ -171,13 +171,16 @@ jobs:
           }
           adb -s "$TARGET_DEVICE" shell logcat -c
 
-      - name: AI Vision Login Agent (Gemini)
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
+            - name: AI Vision Login Agent (Gemini)
+              env:
+                GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+              run: |
           set -x
           nohup frida -D "$TARGET_DEVICE" -f "$PACKAGE" -l universal_ssl_bypass.js -o frida_output.log > frida_stdout.log 2>&1 &
           FRIDA_PID=$!
+          sleep 12
+          python3 ai_vision_agent.py
+          kill $FRIDA_PID 2>/dev/null || true
           sleep 12
           cat > ai_vision_agent.py << 'PYEOF'
           import os, time, json, subprocess, base64
