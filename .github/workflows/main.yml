@@ -220,7 +220,8 @@ time.sleep(5)
 
 for step in range(15):
     img = screenshot()
-    result = ask_ai(f"Analysiere Screen. JSON: {{'action':'tap_email|tap_password|tap_login|wait|success|dismiss_dialog','x':N,'y':N,'reason':'...'}}. Regeln: Login-Screen -> Email -> Passwort -> Login-Button. Dialog -> dismiss. Splash -> wait. Home -> success. Email: {EMAIL}, Password: {PASSWORD}", img)
+    prompt_text = "Analysiere Screen. JSON: " + '{"action":"tap_email|tap_password|tap_login|wait|success|dismiss_dialog","x":N,"y":N,"reason":"..."}' + ". Regeln: Login-Screen -> Email -> Passwort -> Login-Button. Dialog -> dismiss. Splash -> wait. Home -> success. Email: " + EMAIL + ", Password: " + PASSWORD
+    result = ask_ai(prompt_text, img)
     if not result:
         continue
     a = result.get("action", "wait")
@@ -299,16 +300,16 @@ import os, re, json, glob
 traffic = json.load(open('traffic.json')) if os.path.exists('traffic.json') else []
 code_files = glob.glob("jadx-output/**/*.java", recursive=True) + glob.glob("apktool-output/smali*/**/*.smali", recursive=True)
 patterns = {
-    'timestamp': [(r'System\.currentTimeMillis\(\)', 'System.currentTimeMillis()'), (r'new Date\(\)', 'new Date()')],
-    'uuid': [(r'UUID\.randomUUID\(\)', 'UUID.randomUUID()')],
-    'nonce': [(r'SecureRandom', 'SecureRandom'), (r'Random\.nextBytes', 'Random bytes')],
-    'hash': [(r'MessageDigest\.getInstance\(["\']([^"\']+)["\']\)', 'MessageDigest({0})')],
-    'hmac': [(r'Mac\.getInstance\(["\']([^"\']+)["\']\)', 'Mac({0})'), (r'HmacSHA', 'HmacSHA*')],
-    'signature': [(r'Signature\.getInstance', 'Signature')],
-    'encryption': [(r'Cipher\.getInstance\(["\']([^"\']+)["\']\)', 'Cipher({0})'), (r'SecretKeySpec', 'SecretKeySpec')],
-    'encoding': [(r'Base64\.(encode|decode|encodeToString)', 'Base64'), (r'URLEncoder\.encode', 'URLEncoder')],
-    'device_id': [(r'Settings\.Secure\.ANDROID_ID', 'Android ID'), (r'Build\.SERIAL', 'Build.SERIAL')],
-    'network': [(r'OkHttpClient\.Builder', 'OkHttp'), (r'Retrofit\.Builder', 'Retrofit'), (r'addInterceptor', 'Interceptor'), (r'@Headers?\(', 'Headers')]
+    'timestamp': [r'System\.currentTimeMillis\(\)', r'new Date\(\)'],
+    'uuid': [r'UUID\.randomUUID\(\)'],
+    'nonce': [r'SecureRandom', r'Random\.nextBytes'],
+    'hash': [r'MessageDigest\.getInstance\(["\']([^"\']+)["\']\)'],
+    'hmac': [r'Mac\.getInstance\(["\']([^"\']+)["\']\)', r'HmacSHA'],
+    'signature': [r'Signature\.getInstance'],
+    'encryption': [r'Cipher\.getInstance', r'SecretKeySpec'],
+    'encoding': [r'Base64\.(encode|decode)', r'URLEncoder\.encode'],
+    'device_id': [r'Settings\.Secure\.ANDROID_ID', r'Build\.SERIAL'],
+    'network': [r'OkHttpClient', r'Retrofit', r'addInterceptor']
 }
 findings = {c: [] for c in patterns}
 for fp in code_files:
@@ -316,11 +317,10 @@ for fp in code_files:
         with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
         for cat, pats in patterns.items():
-            for pat, desc in pats:
+            for pat in pats:
                 for m in re.finditer(pat, content, re.I):
                     ctx = content[max(0,m.start()-500):min(len(content),m.end()+500)].strip()
-                    algo = m.group(1) if m.groups() else ""
-                    findings[cat].append({'file':fp,'algorithm':algo,'description':desc.format(algo) if '{0}' in desc else desc,'context':ctx})
+                    findings[cat].append({'file':fp,'pattern':pat,'context':ctx})
     except:
         pass
 summary = {c: len(i) for c,i in findings.items()}
@@ -329,7 +329,7 @@ print(f"Found {sum(summary.values())} findings")
 PYEOF
           python3 deep_analyzer.py
 
-      - name: Validate Generation Logic (1:1 Replication)
+      - name: Validate Generation Logic
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -479,7 +479,7 @@ with open('validation_status.txt', 'w') as f:
 PYEOF
           python3 validate_logic.py
 
-      - name: Deep Re-Analysis (Gemini Code Intelligence)
+      - name: Deep Re-Analysis (Gemini)
         if: always()
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -546,17 +546,7 @@ for fail in failed:
         reanalysis_results.append({'key': key, 'type': traffic_type, 'status': 'NO_CODE_FOUND'})
         continue
     
-    # YAML-SAFE STRING CONSTRUCTION (vermeidet {{ }} Parsing-Fehler in GitHub Actions)
-    json_template = '{' + """
-  "algorithm": "z.B. HmacSHA256",
-  "secret_key": "der hardcoded key oder null",
-  "message_construction": "Beschreibung wie die Message gebaut wird",
-  "encoding": "hex/base64/raw",
-  "python_code": "vollstaendiger Python-Code der den Wert generiert",
-  "test_output": "Beispielausgabe des Python-Codes",
-  "confidence": "high/medium/low",
-  "explanation": "Kurze Erklaerung der Logik"
-""" + '}'
+    json_template = '{"algorithm":"...","secret_key":"...","message_construction":"...","encoding":"...","python_code":"...","test_output":"...","confidence":"...","explanation":"..."}'
     
     prompt = f"""Du bist ein Android Reverse Engineering Experte.
 
@@ -571,14 +561,10 @@ Hier ist der relevante decompilierte Java-Code der App:
 
 AUFGABE:
 1. Analysiere EXAKT wie dieser Parameter generiert wird
-2. Identifiziere:
-   - Den Secret Key (falls vorhanden, hardcoded)
-   - Die Message-Reihenfolge
-   - Den Algorithmus (SHA256, HmacSHA256, etc.)
-   - Das Encoding (Hex, Base64, etc.)
+2. Identifiziere Secret Key, Message-Reihenfolge, Algorithmus, Encoding
 3. Gib Python-Code zurueck, der den Wert 1:1 repliziert
 
-ANTWORTFORMAT (nur JSON, keine Markdown-Formatierung):
+ANTWORTFORMAT (nur JSON):
 {json_template}
 """
     
@@ -714,7 +700,7 @@ for cat, items in findings.get('findings', {}).items():
         report.append(f"[{cat.upper()}] - {len(items)} Fundstellen")
         report.append("-" * 60)
         for i, item in enumerate(items[:2], 1):
-            report.append(f"  [{i}] {item['description']}")
+            report.append(f"  [{i}] {item['pattern']}")
             report.append(f"      File: {item['file']}")
             report.append("      Context:")
             for line in item['context'].split('\n')[:6]:
