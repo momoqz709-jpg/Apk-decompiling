@@ -53,7 +53,7 @@ jobs:
             sudo ln -sf /dev/binderfs/vndbinder /dev/vndbinder || true
           fi
           sudo chmod 666 /dev/binder /dev/hwbinder /dev/vndbinder /dev/binderfs/* 2>/dev/null || true
-          pip3 install --upgrade --break-system-packages frida-tools mitmproxy google-generativeai Pillow requests
+          pip3 install --upgrade --break-system-packages frida-tools mitmproxy google-genai Pillow requests
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Create Universal SSL-Pinning Bypass Hook
@@ -181,10 +181,10 @@ jobs:
           sleep 12
           cat > ai_vision_agent.py << 'PYEOF'
           import os, time, json, subprocess, base64
-          import google.generativeai as genai
+          from google import genai
+          from google.genai import types
           from PIL import Image
-          genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-          model = genai.GenerativeModel("gemini-3.6-flash")
+          client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
           SERIAL = os.environ["TARGET_DEVICE"]
           PACKAGE = os.environ["PACKAGE"]
           EMAIL = os.environ["TEST_EMAIL"]
@@ -198,7 +198,11 @@ jobs:
               return Image.open("screen.png")
           def ask_ai(prompt, img):
               try:
-                  response = model.generate_content([prompt, img], generation_config=genai.GenerationConfig(response_mime_type="application/json"))
+                  response = client.models.generate_content(
+                      model="gemini-3.6-flash",
+                      contents=[prompt, img],
+                      config=types.GenerateContentConfig(response_mime_type="application/json")
+                  )
                   return json.loads(response.text)
               except Exception as e:
                   print(f"AI Error: {e}")
@@ -206,11 +210,11 @@ jobs:
           sh(["shell", "am", "force-stop", PACKAGE])
           time.sleep(2)
           sh(["shell", "monkey", "-p", PACKAGE, "1"])
-          time.sleep(8)
+          time.sleep(10)
           for step in range(15):
               print(f"\n[Vision AI] Step {step}: Capturing screen...")
               img = take_screenshot()
-              prompt_text = "Analysiere diesen Android-Screenshot. Identifiziere UI-Elemente für den Login. Gib NUR JSON zurück im Format: {\"action\": \"tap_email|tap_password|tap_login|wait|success|dismiss_dialog\", \"x\": <pixel_x>, \"y\": <pixel_y>, \"reason\": \"<text>\"} Regeln: 1. Login-Screen: Tippe Email-Feld, dann Passwort-Feld, dann Login-Button. 2. Dialog/Popup: Tippe Schließen-Button (dismiss_dialog). 3. Splash/Loading: Warte (wait, x=0, y=0). 4. Home/Dashboard sichtbar: Erfolg (success). Nutze diese Email: " + EMAIL + " und dieses Passwort: " + PASSWORD
+              prompt_text = "Analysiere diesen Android-Screenshot der App " + PACKAGE + ". Identifiziere UI-Elemente für den Login. Gib NUR JSON zurück im Format: {\"action\": \"tap_email|tap_password|tap_login|wait|success|dismiss_dialog\", \"x\": <pixel_x>, \"y\": <pixel_y>, \"reason\": \"<text>\"} Regeln: 1. Wenn die App nicht im Vordergrund ist oder ein Dialog erscheint: Tippe auf die App oder dismiss_dialog. 2. Login-Screen: Tippe Email-Feld, dann Passwort-Feld, dann Login-Button. 3. Splash/Loading: Warte (wait, x=0, y=0). 4. Home/Dashboard DER APP sichtbar: Erfolg (success). Nutze diese Email: " + EMAIL + " und dieses Passwort: " + PASSWORD
               result = ask_ai(prompt_text, img)
               if not result:
                   time.sleep(3)
@@ -241,7 +245,7 @@ jobs:
                           sh(["shell", "input", "keyevent", "66"])
                       time.sleep(2)
           print("Warte auf finale Netzwerk-Requests...")
-          time.sleep(8)
+          time.sleep(15)
           PYEOF
           python3 ai_vision_agent.py
           kill $FRIDA_PID 2>/dev/null || true
@@ -286,10 +290,11 @@ jobs:
             echo "APK not found, skipping decompilation."
             exit 0
           fi
-          wget -q https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar -O apktool.jar
+          wget -q https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar -O apktool.jar || true
           java -jar apktool.jar d "${{ env.APK_PATH }}" -o apktool-output -f || true
-          wget -q https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip -O jadx.zip
-          unzip -q jadx.zip -d jadx && chmod +x jadx/bin/jadx
+          wget -q https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip -O jadx.zip || true
+          unzip -q jadx.zip -d jadx || true
+          chmod +x jadx/bin/jadx || true
           ./jadx/bin/jadx -d jadx-output --show-bad-code "${{ env.APK_PATH }}" || true
 
       - name: Deep Parameter Analysis
@@ -336,9 +341,9 @@ jobs:
           cat > final_validation.py << 'PYEOF'
           import os, json, re, glob, time, hashlib, hmac, uuid, secrets
           from datetime import datetime
-          import google.generativeai as genai
-          genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-          model = genai.GenerativeModel("gemini-3.6-flash")
+          from google import genai
+          from google.genai import types
+          client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
           findings = json.load(open('findings.json')) if os.path.exists('findings.json') else {'findings':{},'summary':{},'traffic':[]}
           traffic = findings.get('traffic', [])
           login_req = next((f for f in traffic if any(k in f.get('url','').lower() for k in ['login','auth','token'])), None)
@@ -379,7 +384,11 @@ jobs:
               prompt += "ANTWORTFORMAT (nur JSON):"
               prompt += '{"explanation": "...", "python_code": "...", "secret_key": "...", "confidence": "high/medium/low"}'
               try:
-                  resp = model.generate_content([prompt], generation_config=genai.GenerationConfig(response_mime_type="application/json"))
+                  resp = client.models.generate_content(
+                      model="gemini-3.6-flash",
+                      contents=[prompt],
+                      config=types.GenerateContentConfig(response_mime_type="application/json")
+                  )
                   analysis = json.loads(resp.text)
                   report.append(f"Algorithm: {analysis.get('explanation', 'N/A')}")
                   report.append(f"Secret Key: {analysis.get('secret_key', 'Not found')}")
