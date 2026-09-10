@@ -209,14 +209,15 @@ jobs:
                       data=img_bytes,
                       mime_type="image/png"
                   )
-                  response = client.models.generate_content(
-                      model="gemini-3.6-flash",
-                      contents=[prompt, image_part],
-                      config=types.GenerateContentConfig(
-                          response_mime_type="application/json",
-                          timeout=30.0
-                      )
-                  )
+                          response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=[prompt, image_part],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                timeout=30.0  # <--- HIER liegt der Fehler
+            )
+      
+
                   print("[Vision AI] Response received")
                   return json.loads(response.text)
               except Exception as e:
