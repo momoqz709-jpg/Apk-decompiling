@@ -184,7 +184,7 @@ jobs:
           import google.generativeai as genai
           from PIL import Image
           genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-          model = genai.GenerativeModel("gemini-2.0-flash")
+          model = genai.GenerativeModel("gemini-3.6-flash")
           SERIAL = os.environ["TARGET_DEVICE"]
           PACKAGE = os.environ["PACKAGE"]
           EMAIL = os.environ["TEST_EMAIL"]
@@ -249,30 +249,34 @@ jobs:
       - name: Export Complete Network Traffic
         run: |
           echo "EXPORTING COMPLETE TRAFFIC"
-          if [ -f "mitm_out/flows.mitm" ]; then
-            mitmdump -n -r mitm_out/flows.mitm --flow-detail 3 > traffic_complete.txt || true
-            python3 << 'PYEOF'
-            import json, subprocess, re
-            r = subprocess.run(["mitmdump", "-n", "-r", "mitm_out/flows.mitm", "--set", "flow_detail=3"], capture_output=True, text=True)
-            flows, cur = [], None
-            for line in r.stdout.split('\n'):
-                if '>>' in line and any(m in line for m in ['GET','POST','PUT']):
-                    if cur: flows.append(cur)
-                    m = re.search(r'>>\s+(\w+)\s+(.+)', line)
-                    if m: cur = {'method': m.group(1), 'url': m.group(2), 'headers': {}, 'body': ''}
-                elif cur and ': ' in line and not line.startswith('    '):
-                    k, v = line.split(': ', 1)
-                    cur['headers'][k.strip()] = v.strip()
-                elif cur and line.strip() and not line.startswith('>>'):
-                    cur['body'] += line + '\n'
-            if cur: flows.append(cur)
-            json.dump(flows, open('traffic.json','w'), indent=2)
-            print(f"Exported {len(flows)} flows to traffic.json")
-            PYEOF
-          else
-            echo "Kein Traffic aufgezeichnet." > traffic_complete.txt
-            echo "[]" > traffic.json
-          fi
+          cat > export_traffic.py << 'PYEOF'
+          import json, subprocess, re, os
+          if os.path.exists("mitm_out/flows.mitm"):
+              r = subprocess.run(["mitmdump", "-n", "-r", "mitm_out/flows.mitm", "--set", "flow_detail=3"], capture_output=True, text=True)
+              flows, cur = [], None
+              for line in r.stdout.split('\n'):
+                  if '>>' in line and any(m in line for m in ['GET','POST','PUT']):
+                      if cur: flows.append(cur)
+                      m = re.search(r'>>\s+(\w+)\s+(.+)', line)
+                      if m: cur = {'method': m.group(1), 'url': m.group(2), 'headers': {}, 'body': ''}
+                  elif cur and ': ' in line and not line.startswith('    '):
+                      k, v = line.split(': ', 1)
+                      cur['headers'][k.strip()] = v.strip()
+                  elif cur and line.strip() and not line.startswith('>>'):
+                      cur['body'] += line + '\n'
+              if cur: flows.append(cur)
+              with open('traffic.json','w') as f:
+                  json.dump(flows, f, indent=2)
+              print(f"Exported {len(flows)} flows to traffic.json")
+              with open('traffic_complete.txt', 'w') as out:
+                  subprocess.run(["mitmdump", "-n", "-r", "mitm_out/flows.mitm", "--flow-detail", "3"], stdout=out)
+          else:
+              with open('traffic_complete.txt', 'w') as f:
+                  f.write("Kein Traffic aufgezeichnet.")
+              with open('traffic.json', 'w') as f:
+                  f.write("[]")
+          PYEOF
+          python3 export_traffic.py
 
       - name: APK Decompilation (apktool + jadx)
         continue-on-error: true
@@ -334,7 +338,7 @@ jobs:
           from datetime import datetime
           import google.generativeai as genai
           genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-          model = genai.GenerativeModel("gemini-2.0-flash")
+          model = genai.GenerativeModel("gemini-3.6-flash")
           findings = json.load(open('findings.json')) if os.path.exists('findings.json') else {'findings':{},'summary':{},'traffic':[]}
           traffic = findings.get('traffic', [])
           login_req = next((f for f in traffic if any(k in f.get('url','').lower() for k in ['login','auth','token'])), None)
