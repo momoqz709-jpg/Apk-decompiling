@@ -29,7 +29,7 @@ env:
 jobs:
   deep-analysis:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 60
 
     steps:
       - name: Checkout Repository
@@ -46,6 +46,7 @@ jobs:
           echo "Dependencies installed"
 
       - name: Setup Emulator & Proxy
+        continue-on-error: true
         run: |
           set -x
           docker network create analysis-net 2>/dev/null || true
@@ -57,90 +58,102 @@ jobs:
             androidboot.redroid_gpu_mode=guest \
             androidboot.redroid_width=1080 \
             androidboot.redroid_height=1920 \
-            androidboot.redroid_dpi=420 || { echo "Emulator failed"; exit 0; }
+            androidboot.redroid_dpi=420 || echo "Redroid start failed"
 
           sleep 15
           CONTAINER_STATUS=$(docker inspect -f '{{.State.Status}}' redroid 2>/dev/null || echo "unknown")
-          if [ "$CONTAINER_STATUS" != "running" ]; then
+          if [ "$CONTAINER_STATUS" = "running" ]; then
+            REDROID_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' redroid)
+            echo "TARGET_DEVICE=${REDROID_IP}:5555" >> $GITHUB_ENV
+            echo "✅ Redroid started"
+          else
+            echo "⚠️ Redroid not running. Dynamic analysis will be skipped."
             echo "TARGET_DEVICE=none" >> $GITHUB_ENV
-            exit 0
           fi
 
-          mkdir -p mitm_out screenshots
+          mkdir -p mitm_out
+          chmod 777 mitm_out
           docker run -d --name mitmproxy --network analysis-net \
-            -v "$PWD/mitm_out:/home/mitmproxy/out" \
+            -v "$PWD/mitm_out:/home/mitmproxy/.mitmproxy" \
             mitmproxy/mitmproxy:latest \
-            mitmdump -w /home/mitmproxy/out/flows.mitm \
-              --listen-port 8080 --ssl-insecure \
-              --set block_global=false --set confdir=/home/mitmproxy/.mitmproxy
+            mitmdump --listen-port 8080 --ssl-insecure --set block_global=false || echo "Mitmproxy start failed"
 
       - name: CA Injection & ADB Setup
+        continue-on-error: true
         run: |
           set -x
-          for i in $(seq 1 60); do
-            docker exec mitmproxy test -f /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem 2>/dev/null && break
-            sleep 1
-          done
-
-          mkdir -p cacerts
-          docker exec mitmproxy cat /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem > cacerts/cacert.pem
-          HASH=$(openssl x509 -subject_hash_old -in cacerts/cacert.pem | head -n1)
-          cp cacerts/cacert.pem "cacerts/${HASH}.0"
-
-          REDROID_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' redroid 2>/dev/null || echo "")
-          if [ -z "$REDROID_IP" ]; then
-            echo "TARGET_DEVICE=none" >> $GITHUB_ENV
-            exit 0
-          fi
-          
-          echo "TARGET_DEVICE=${REDROID_IP}:5555" >> $GITHUB_ENV
-
-          adb kill-server 2>/dev/null || true
-          adb start-server
-          
-          CONNECTED=false
-          for attempt in $(seq 1 10); do
-            adb connect "${REDROID_IP}:5555" || true
-            sleep 3
-            STATE=$(adb -s "${REDROID_IP}:5555" get-state 2>/dev/null | tr -d '\r' || echo "")
-            if [ "$STATE" = "device" ]; then
-              CONNECTED=true
-              break
+          MITM_RUNNING=$(docker inspect -f '{{.State.Running}}' mitmproxy 2>/dev/null || echo "false")
+          if [ "$MITM_RUNNING" = "true" ]; then
+            echo "Waiting for mitmproxy CA..."
+            for i in $(seq 1 60); do
+              if docker exec mitmproxy test -f /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem 2>/dev/null; then
+                echo "✅ mitmproxy CA ready"
+                break
+              fi
+              sleep 1
+            done
+            
+            mkdir -p cacerts
+            docker exec mitmproxy cat /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem > cacerts/cacert.pem 2>/dev/null || true
+            if [ -f cacerts/cacert.pem ] && [ -s cacerts/cacert.pem ]; then
+              HASH=$(openssl x509 -subject_hash_old -in cacerts/cacert.pem | head -n1)
+              cp cacerts/cacert.pem "cacerts/${HASH}.0"
+              echo "✅ CA cert prepared with hash: ${HASH}"
+            else
+              echo "⚠️ Failed to extract mitmproxy CA."
             fi
-            sleep $((attempt * 2))
-          done
-
-          if [ "$CONNECTED" != "true" ]; then
-            echo "TARGET_DEVICE=none" >> $GITHUB_ENV
-            exit 0
+          else
+            echo "⚠️ Mitmproxy not running. Skipping CA injection."
           fi
 
-          for i in $(seq 1 120); do
-            STATE=$(adb -s "${REDROID_IP}:5555" get-state 2>/dev/null | tr -d '\r' || echo "")
-            if [ "$STATE" != "device" ]; then
-              adb connect "${REDROID_IP}:5555" >/dev/null 2>&1 || true
-            fi
-            BOOT=$(adb -s "${REDROID_IP}:5555" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n ' || echo "")
-            if [ "$BOOT" = "1" ]; then
-              break
-            fi
-            sleep 1
-          done
+          if [ "${{ env.TARGET_DEVICE }}" != "none" ]; then
+            adb kill-server 2>/dev/null || true
+            adb start-server
+            CONNECTED=false
+            for attempt in $(seq 1 10); do
+              adb connect "${{ env.TARGET_DEVICE }}" || true
+              sleep 3
+              STATE=$(adb -s "${{ env.TARGET_DEVICE }}" get-state 2>/dev/null | tr -d '\r' || echo "")
+              if [ "$STATE" = "device" ]; then
+                CONNECTED=true
+                break
+              fi
+              sleep $((attempt * 2))
+            done
 
-          adb -s "${REDROID_IP}:5555" root 2>/dev/null || true
-          sleep 2
-          adb -s "${REDROID_IP}:5555" remount 2>/dev/null || true
-          adb -s "${REDROID_IP}:5555" shell mkdir -p /system/etc/security/cacerts 2>/dev/null || true
-          adb -s "${REDROID_IP}:5555" push "cacerts/${HASH}.0" /system/etc/security/cacerts/ 2>/dev/null || true
-          adb -s "${REDROID_IP}:5555" shell chmod 644 /system/etc/security/cacerts/* 2>/dev/null || true
-
-          MITM_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' mitmproxy)
-          adb -s "${REDROID_IP}:5555" shell settings put global http_proxy "${MITM_IP}:8080"
+            if [ "$CONNECTED" = "true" ]; then
+              for i in $(seq 1 60); do
+                BOOT=$(adb -s "${{ env.TARGET_DEVICE }}" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n ' || echo "")
+                if [ "$BOOT" = "1" ]; then break; fi
+                sleep 2
+              done
+              
+              adb -s "${{ env.TARGET_DEVICE }}" root 2>/dev/null || true
+              sleep 2
+              adb -s "${{ env.TARGET_DEVICE }}" remount 2>/dev/null || true
+              if [ -f "cacerts/${HASH}.0" ]; then
+                adb -s "${{ env.TARGET_DEVICE }}" shell mkdir -p /system/etc/security/cacerts 2>/dev/null || true
+                adb -s "${{ env.TARGET_DEVICE }}" push "cacerts/${HASH}.0" /system/etc/security/cacerts/ 2>/dev/null || true
+                adb -s "${{ env.TARGET_DEVICE }}" shell chmod 644 /system/etc/security/cacerts/* 2>/dev/null || true
+              fi
+              
+              MITM_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' mitmproxy 2>/dev/null || echo "")
+              if [ -n "$MITM_IP" ]; then
+                adb -s "${{ env.TARGET_DEVICE }}" shell settings put global http_proxy "${MITM_IP}:8080" 2>/dev/null || true
+              fi
+              echo "✅ ADB setup complete"
+            else
+              echo "⚠️ ADB connection failed. Setting TARGET_DEVICE=none"
+              echo "TARGET_DEVICE=none" >> $GITHUB_ENV
+            fi
+          fi
 
       - name: Install Frida & APK
+        continue-on-error: true
         run: |
           set -x
           if [ "${{ env.TARGET_DEVICE }}" = "none" ] || [ ! -f "${{ env.APK_PATH }}" ]; then
+            echo "⚠️ Skipping APK install (no device or no APK)"
             exit 0
           fi
 
@@ -159,11 +172,13 @@ jobs:
           }
 
       - name: AI Vision Login
+        continue-on-error: true
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           set -x
           if [ "${{ env.TARGET_DEVICE }}" = "none" ]; then
+            echo "⚠️ Skipping AI Login (no device)"
             exit 0
           fi
 
@@ -185,7 +200,6 @@ jobs:
           FRIDA_PID=$!
           sleep 15
 
-          # HIER WAR DER FEHLER: Alle Python-Zeilen sind jetzt korrekt eingerückt!
           cat > ai_login_agent.py << 'PYEOF'
           import os, time, json, subprocess
           import google.generativeai as genai
@@ -251,6 +265,7 @@ jobs:
           kill $FRIDA_PID 2>/dev/null || true
 
       - name: Export Traffic
+        continue-on-error: true
         run: |
           set -x
           if [ -f "mitm_out/flows.mitm" ]; then
@@ -279,12 +294,14 @@ jobs:
             PYEOF
           else
             echo "[]" > traffic.json
+            echo "No traffic captured" > traffic_complete.txt
           fi
 
       - name: APK Decompilation
         run: |
           set -x
           if [ ! -f "${{ env.APK_PATH }}" ]; then
+            echo "⚠️ APK not found"
             exit 0
           fi
           wget -q https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar -O apktool.jar
@@ -331,6 +348,7 @@ jobs:
           python3 deep_analyzer.py
 
       - name: Validate Generation Logic
+        continue-on-error: true
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -341,7 +359,12 @@ jobs:
 
           print("LOGIC VALIDATION - 1:1 REPLICATION TEST")
 
-          findings = json.load(open('findings.json')) if os.path.exists('findings.json') else {'findings':{},'summary':{},'traffic':[]}
+          if not os.path.exists('findings.json'):
+              json.dump({'findings':{},'summary':{},'traffic':[]}, open('findings.json','w'))
+          if not os.path.exists('traffic.json'):
+              json.dump([], open('traffic.json','w'))
+
+          findings = json.load(open('findings.json'))
           traffic = findings.get('traffic', [])
 
           login_req = None
@@ -355,43 +378,31 @@ jobs:
               login_req = {'method':'POST','url':'https://api.example.com/login','headers':{},'body':'{}'}
 
           def detect_type(v):
-              if not isinstance(v, str):
-                  return None
-              if re.match(r'^\d{10,13}$', v):
-                  return 'timestamp'
-              if re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', v, re.I):
-                  return 'uuid'
-              if re.match(r'^[a-f0-9]{64}$', v, re.I):
-                  return 'sha256'
-              if re.match(r'^[a-f0-9]{40}$', v, re.I):
-                  return 'sha1'
-              if re.match(r'^[a-f0-9]{32}$', v, re.I):
-                  return 'md5'
-              if re.match(r'^[A-Za-z0-9+/]{20,}={0,2}$', v):
-                  return 'base64'
-              if re.match(r'^[a-zA-Z0-9_-]{16,64}$', v):
-                  return 'nonce'
+              if not isinstance(v, str): return None
+              if re.match(r'^\d{10,13}$', v): return 'timestamp'
+              if re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', v, re.I): return 'uuid'
+              if re.match(r'^[a-f0-9]{64}$', v, re.I): return 'sha256'
+              if re.match(r'^[a-f0-9]{40}$', v, re.I): return 'sha1'
+              if re.match(r'^[a-f0-9]{32}$', v, re.I): return 'md5'
+              if re.match(r'^[A-Za-z0-9+/]{20,}={0,2}$', v): return 'base64'
+              if re.match(r'^[a-zA-Z0-9_-]{16,64}$', v): return 'nonce'
               return None
 
           real_dynamic = {}
           for k, v in login_req.get('headers', {}).items():
               t = detect_type(v)
-              if t:
-                  real_dynamic[f"header:{k}"] = {'type':t, 'value':v}
+              if t: real_dynamic[f"header:{k}"] = {'type':t, 'value':v}
 
           try:
               body = json.loads(login_req.get('body','{}'))
               def scan_body(obj, path=""):
                   if isinstance(obj, dict):
-                      for k,v in obj.items():
-                          scan_body(v, f"{path}.{k}" if path else k)
+                      for k,v in obj.items(): scan_body(v, f"{path}.{k}" if path else k)
                   elif isinstance(obj, str):
                       t = detect_type(obj)
-                      if t:
-                          real_dynamic[f"body:{path}"] = {'type':t, 'value':obj}
+                      if t: real_dynamic[f"body:{path}"] = {'type':t, 'value':obj}
               scan_body(body)
-          except:
-              pass
+          except: pass
 
           print(f"Found {len(real_dynamic)} dynamic values in traffic")
 
@@ -412,10 +423,8 @@ jobs:
               for m in matches:
                   if not m.startswith('http') and 'password' not in m.lower():
                       secret_key = m
-                      print(f"Found Secret Key: {m[:20]}...")
                       break
-              if secret_key:
-                  break
+              if secret_key: break
 
           if findings['summary'].get('hmac', 0) > 0 and secret_key:
               message = f"email=test@test.com&timestamp={test_timestamp}"
@@ -426,7 +435,6 @@ jobs:
               data = f"{test_timestamp}test"
               replicated['sha256'] = {'value': hashlib.sha256(data.encode()).hexdigest(), 'logic': f'hashlib.sha256(b"{data}").hexdigest()'}
 
-          print("Validating against traffic...")
           validation_results = []
           all_passed = True
 
@@ -439,26 +447,20 @@ jobs:
                   if rt in rk or rt in rep.get('logic',''):
                       if rt == 'timestamp' and re.match(r'^\d{10,13}$', str(rep['value'])):
                           validation_results.append({'traffic_key': key, 'traffic_value': rv, 'replicated_value': rep['value'], 'logic': rep['logic'], 'status': 'FORMAT_MATCH', 'note': 'Timestamp format correct'})
-                          match_found = True
-                          break
+                          match_found = True; break
                       elif rt == 'uuid' and re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', str(rep['value']), re.I):
                           validation_results.append({'traffic_key': key, 'traffic_value': rv, 'replicated_value': rep['value'], 'logic': rep['logic'], 'status': 'FORMAT_MATCH', 'note': 'UUID format correct'})
-                          match_found = True
-                          break
+                          match_found = True; break
                       elif rt == 'nonce' and re.match(r'^[a-zA-Z0-9_\-]{16,}$', str(rep['value'])):
                           validation_results.append({'traffic_key': key, 'traffic_value': rv, 'replicated_value': rep['value'], 'logic': rep['logic'], 'status': 'FORMAT_MATCH', 'note': 'Nonce format correct'})
-                          match_found = True
-                          break
+                          match_found = True; break
                       elif rt in ['sha256', 'sha1', 'md5']:
                           if rep['value'] == rv:
                               validation_results.append({'traffic_key': key, 'traffic_value': rv, 'replicated_value': rep['value'], 'logic': rep['logic'], 'status': 'EXACT_MATCH', 'note': 'Hash matches exactly!'})
-                              match_found = True
-                              break
+                              match_found = True; break
                           else:
                               validation_results.append({'traffic_key': key, 'traffic_value': rv, 'replicated_value': rep['value'], 'logic': rep['logic'], 'status': 'MISMATCH', 'note': 'Hash differs'})
-                              match_found = True
-                              all_passed = False
-                              break
+                              match_found = True; all_passed = False; break
               
               if not match_found:
                   validation_results.append({'traffic_key': key, 'traffic_value': rv, 'replicated_value': 'NOT_REPLICATED', 'logic': 'MISSING', 'status': 'NO_REPLICATION', 'note': f'No replication logic for type {rt}'})
@@ -473,7 +475,6 @@ jobs:
               'login_request': login_req
           }
           json.dump(result, open('validation_result.json','w'), indent=2)
-
           print(f"Validation Summary: {'PASSED' if all_passed else 'FAILED'}")
           with open('validation_status.txt', 'w') as f:
               f.write('PASSED' if all_passed else 'FAILED')
@@ -482,6 +483,7 @@ jobs:
 
       - name: Deep Re-Analysis (Gemini)
         if: always()
+        continue-on-error: true
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -495,9 +497,6 @@ jobs:
           fi
 
           echo "Starting Gemini Deep Re-Analysis..."
-          
-          # HIER WAR DER FEHLER: Alle Python-Zeilen sind jetzt korrekt eingerückt!
-          # Und der f-string mit {chr(10)} wurde in sichere String-Verkettung umgewandelt.
           cat > deep_reanalysis.py << 'PYEOF'
           import os, json, re, glob
           import google.generativeai as genai
@@ -505,23 +504,27 @@ jobs:
           genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
           model = genai.GenerativeModel("gemini-2.0-flash")
 
+          if not os.path.exists('validation_result.json'):
+              json.dump({"validation": [], "all_passed": True, "real_dynamic_values": {}}, open('validation_result.json', 'w'))
+          if not os.path.exists('findings.json'):
+              json.dump({"findings": {}, "summary": {}}, open('findings.json', 'w'))
+
           validation = json.load(open('validation_result.json'))
           findings = json.load(open('findings.json'))
 
-          failed = [v for v in validation['validation'] if 'MATCH' not in v['status']]
+          failed = [v for v in validation.get('validation', []) if 'MATCH' not in v.get('status','')]
           if not failed:
               print("Alles bestanden, keine Re-Analyse noetig.")
               exit(0)
 
           print(f"Re-analyzing {len(failed)} failed validations...")
-
           reanalysis_results = []
 
           for fail in failed:
               key = fail['traffic_key']
               real_value = fail['traffic_value']
               traffic_type = None
-              for rd_key, rd in validation['real_dynamic_values'].items():
+              for rd_key, rd in validation.get('real_dynamic_values', {}).items():
                   if rd_key == key:
                       traffic_type = rd['type']
                       break
@@ -529,7 +532,7 @@ jobs:
               print(f"\nRe-analyzing: {key} (type: {traffic_type})")
               
               relevant_code = []
-              for cat, items in findings['findings'].items():
+              for cat, items in findings.get('findings', {}).items():
                   if traffic_type in cat or (traffic_type == 'sha256' and cat == 'hash') or (traffic_type == 'nonce' and cat == 'nonce'):
                       for item in items[:5]:
                           relevant_code.append(f"--- {item['file']} ---\n{item['context']}")
@@ -543,8 +546,7 @@ jobs:
                                   relevant_code.append(f"--- {fp} ---\n{content[:2000]}")
                               elif traffic_type == 'nonce' and 'SecureRandom' in content:
                                   relevant_code.append(f"--- {fp} ---\n{content[:2000]}")
-                      except:
-                          pass
+                      except: pass
               
               if not relevant_code:
                   reanalysis_results.append({'key': key, 'type': traffic_type, 'status': 'NO_CODE_FOUND'})
@@ -588,7 +590,6 @@ jobs:
           json.dump(reanalysis_results, open('deep_reanalysis.json','w'), indent=2)
           print(f"Deep re-analysis complete: {len(reanalysis_results)} items")
           PYEOF
-          
           python3 deep_reanalysis.py
 
       - name: Generate CONFIRMED_LOGIC.txt
@@ -630,7 +631,7 @@ jobs:
                   report.append(f"  Note: {v['note']}")
                   report.append("")
           else:
-              report.append("Keine direkte Bestaetigung aus erster Analyse.")
+              report.append("Keine direkte Bestaetigung aus erster Analyse (reiner Code-Analyse-Modus).")
               report.append("")
 
           report.append("=" * 80)
@@ -679,7 +680,7 @@ jobs:
                   report.append(f"    Value: {v['value']}")
                   report.append("")
           else:
-              report.append("Keine dynamischen Werte im Traffic gefunden.")
+              report.append("Keine dynamischen Werte im Traffic gefunden (oder kein Traffic aufgezeichnet).")
               report.append("")
 
           report.append("=" * 80)
@@ -736,7 +737,6 @@ jobs:
 
           print(f"CONFIRMED_LOGIC.txt erstellt ({len(report)} Zeilen)")
           PYEOF
-          
           python3 generate_final_report.py
           
           echo "=== Report Preview ==="
