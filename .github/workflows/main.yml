@@ -1,370 +1,498 @@
-name: APK Deep Analysis (Optimized for GitHub Runners)
+name: Ultimate APK Analysis (Redroid + Gemini Vision + Code Logic)
 
 on:
   workflow_dispatch:
     inputs:
       apk_path:
-        description: 'Pfad zur APK im Repo'
+        description: 'Pfad der APK im Repo (z.B. apk/target.apk)'
         required: true
         default: 'app.apk'
       package_name:
-        description: 'Package Name (z.B. com.example.app)'
+        description: 'Package-Name der App (z.B. com.example.app)'
         required: true
         default: 'com.example.app'
       test_email:
-        description: 'Test Email'
+        description: 'Test-E-Mail für den Login'
         required: true
-        default: 'test@example.com'
+        default: 'testuser@gmail.com'
       test_password:
-        description: 'Test Password'
+        description: 'Test-Passwort für den Login'
         required: true
-        default: 'TestPass123'
+        default: 'SecurePassword123!'
 
 env:
   APK_PATH: ${{ github.event.inputs.apk_path }}
   PACKAGE: ${{ github.event.inputs.package_name }}
   TEST_EMAIL: ${{ github.event.inputs.test_email }}
   TEST_PASSWORD: ${{ github.event.inputs.test_password }}
-  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
 jobs:
-  analyze:
+  ai-capture-and-analyze:
     runs-on: ubuntu-latest
-    # Erhöhe das globale Limit, damit der langsame Emulator Zeit hat
     timeout-minutes: 60
-
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           lfs: true
 
-      - name: Setup Java & Python
+      # ==========================================
+      # 🚀 TEIL 1: SCHNELLE REDROID STARTLOGIK (Aus deinem funktionierenden Script)
+      # ==========================================
+      - name: Install Tools & Configure Kernel Binder
         run: |
+          set -x
+          sudo rm -f /etc/apt/sources.list.d/*chrome*
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
           sudo apt-get update
-          sudo apt-get install -y openjdk-17-jdk python3-pip curl unzip jq
-          pip3 install --break-system-packages mitmproxy google-generativeai Pillow requests
+          sudo apt-get install -y android-tools-adb python3-pip openssl unzip curl jq linux-modules-extra-$(uname -r) openjdk-17-jdk
 
-      - name: Start MITMProxy (Host Level)
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || true
+          if [ ! -e /dev/binder ]; then
+            sudo mkdir -p /dev/binderfs
+            sudo mount -t binder binder /dev/binderfs || true
+            sudo ln -sf /dev/binderfs/binder /dev/binder || true
+            sudo ln -sf /dev/binderfs/hwbinder /dev/hwbinder || true
+            sudo ln -sf /dev/binderfs/vndbinder /dev/vndbinder || true
+          fi
+          sudo chmod 666 /dev/binder /dev/hwbinder /dev/vndbinder /dev/binderfs/* 2>/dev/null || true
+
+          # WICHTIG: google-generativeai und Pillow für die Gemini Vision AI hinzugefügt
+          pip3 install --upgrade --break-system-packages frida-tools mitmproxy google-generativeai Pillow requests
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Create Universal SSL-Pinning Bypass Hook
         run: |
-          mkdir -p mitm_out
-          # Startet mitmproxy im Hintergrund
-          nohup mitmdump --listen-port 8080 --set block_global=false --dump-flowhar=mitm_out/traffic.har > mitm.log 2>&1 &
-          echo "⏳ Warte auf MITMProxy Zertifikat..."
-          for i in {1..30}; do
-            if [ -f ~/.mitmproxy/mitmproxy-ca-cert.pem ]; then
-              echo "✅ MITMProxy CA bereit"
+          cat > universal_ssl_bypass.js << 'EOF'
+          Java.perform(function () {
+              console.log("\n⚡ === UNIVERSAL SSL-PINNING BYPASS ACTIVE === ⚡");
+              try {
+                  var TMI = Java.use('com.android.org.conscrypt.TrustManagerImpl');
+                  TMI.checkTrustedRecursive.implementation = function () {
+                      return Java.use("java.util.ArrayList").$new();
+                  };
+              } catch (e) {}
+              try {
+                  var CP = Java.use('okhttp3.CertificatePinner');
+                  CP.check.overload('java.lang.String', 'java.util.List').implementation = function() {};
+              } catch (e) {}
+          });
+          EOF
+
+      - name: Setup Docker Network and Containers
+        run: |
+          docker network create analysis-net 2>/dev/null || true
+
+          for i in {1..3}; do
+            docker run -d --name redroid --privileged \
+              -v /dev/binder:/dev/binder \
+              -v /dev/hwbinder:/dev/hwbinder \
+              -v /dev/vndbinder:/dev/vndbinder \
+              --network analysis-net \
+              redroid/redroid:11.0.0-latest \
+              androidboot.hardware=redroid \
+              androidboot.redroid_gpu_mode=guest \
+              androidboot.redroid_width=1080 \
+              androidboot.redroid_height=1920 \
+              androidboot.redroid_dpi=420 && break
+            sleep 5
+          done
+
+          mkdir -p mitm_out screenshots ui_dumps
+          chmod 777 mitm_out
+
+          for i in {1..5}; do
+            docker run -d --name mitmproxy --network analysis-net \
+              -p 8080:8080 \
+              -e HOME=/home/mitmproxy \
+              -v "$PWD/mitm_out:/home/mitmproxy/out" \
+              mitmproxy/mitmproxy:latest \
+              mitmdump -w /home/mitmproxy/out/flows.mitm \
+                --listen-port 8080 \
+                --ssl-insecure \
+                --set block_global=false \
+                --set confdir=/home/mitmproxy/.mitmproxy && break
+            docker rm -f mitmproxy 2>/dev/null || true
+            sleep 5
+          done
+
+      - name: Install CA Certificate into Android System Store
+        run: |
+          for i in $(seq 1 60); do
+            if docker exec mitmproxy test -f /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem 2>/dev/null; then
               break
             fi
             sleep 1
           done
 
-      # =========================================================
-      # 🚀 DER FIX: Optimierter Emulator für GitHub-Server
-      # =========================================================
-      - name: Run Emulator & AI Login
-        uses: reactivecircus/android-emulator-runner@v2
-        timeout-minutes: 35
-        with:
-          # OPTIMIERUNG 1: Android 9 (API 28) startet 3x schneller als Android 11+
-          api-level: 28
-          # OPTIMIERUNG 2: 32-Bit Architektur frisst weniger RAM und bootet schneller
-          arch: x86
-          # OPTIMIERUNG 3: 'default' (AOSP) statt 'google_apis' spart massive Boot-Zeit
-          target: default
-          profile: pixel
-          disable-animations: true
-          # OPTIMIERUNG 4: Radikale Deaktivierung von Grafik/Sound, um CPU-Last zu senken
-          emulator-options: -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim -camera-back none -camera-front none -no-snapshot
-          script: |
-            set -x
-            echo "📱 Emulator gestartet. Warte auf stabile ADB-Verbindung..."
-            
-            # WICHTIG: Wir warten aktiv auf den 'device' Status, nicht nur auf boot_completed
-            adb wait-for-device
-            echo "ADB Device verbunden. Warte auf System-Boot (kann auf GitHub 5-10 Min dauern)..."
-            
-            # Robuste Boot-Schleife, die nicht sofort abbricht
-            for i in {1..60}; do
-              state=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
-              if [ "$state" = "1" ]; then
-                echo "✅ System vollständig gebootet."
-                break
-              fi
-              echo "Boot-Status: $state (Versuch $i/60)..."
-              sleep 5
-            done
-            
-            # 1. MITM CA Injizieren
-            echo "🔐 Injiziere MITM CA..."
-            adb root
-            sleep 2
-            adb remount
-            adb push ~/.mitmproxy/mitmproxy-ca-cert.pem /sdcard/cacert.pem
-            HASH=$(openssl x509 -subject_hash_old -in ~/.mitmproxy/mitmproxy-ca-cert.pem | head -n1)
-            adb shell mv /sdcard/cacert.pem /system/etc/security/cacerts/$HASH.0
-            adb shell chmod 644 /system/etc/security/cacerts/$HASH.0
-            
-            # 2. Proxy setzen
-            echo "🌐 Setze HTTP Proxy..."
-            adb shell settings put global http_proxy 127.0.0.1:8080
+          # FIX: mkdir -p cacerts stellt sicher, dass das Verzeichnis existiert
+          mkdir -p cacerts
+          docker exec mitmproxy cat /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem > cacerts/cacert.pem
+          HASH=$(openssl x509 -subject_hash_old -in cacerts/cacert.pem | head -n1)
+          cp cacerts/cacert.pem "cacerts/${HASH}.0"
 
-            # 3. Frida Setup
-            echo "🕷️ Lade Frida Server (x86 Version)..."
-            FRIDA_VERSION="16.4.5"
-            # WICHTIG: Da wir 'arch: x86' nutzen, brauchen wir die x86 Frida Version!
-            curl -sL -o frida-server.xz "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-server-${FRIDA_VERSION}-android-x86.xz"
-            xz -d frida-server.xz
-            chmod +x frida-server
-            adb push frida-server /data/local/tmp/
-            adb shell "chmod 755 /data/local/tmp/frida-server"
-            adb shell "nohup /data/local/tmp/frida-server > /data/local/tmp/frida.log 2>&1 &"
-            sleep 3
+          docker exec redroid sh -c "mount -o remount,rw /system 2>/dev/null || true"
+          docker exec redroid sh -c "mkdir -p /system/etc/security/cacerts"
+          docker cp "cacerts/${HASH}.0" redroid:/system/etc/security/cacerts/
+          docker exec redroid sh -c "chmod 644 /system/etc/security/cacerts/*"
 
-            # 4. APK Install
-            echo "📦 Installiere APK..."
-            adb install -r -g "${{ env.APK_PATH }}" || adb shell pm install -r -d -t -g /data/local/tmp/app.apk
-
-            # 5. AI Login Agent
-            echo "🤖 Starte Gemini AI Vision Agent..."
-            cat > ai_login.py << 'PYEOF'
-            import os, time, json, subprocess
-            import google.generativeai as genai
-            from PIL import Image
-
-            genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-            model = genai.GenerativeModel("gemini-2.0-flash")
-            
-            PACKAGE = os.environ.get("PACKAGE")
-            EMAIL = os.environ.get("TEST_EMAIL")
-            PASSWORD = os.environ.get("TEST_PASSWORD")
-            ADB = ["adb"]
-
-            def sh(args):
-                return subprocess.run(ADB + args, capture_output=True, text=True)
-
-            def screenshot():
-                sh(["shell", "screencap", "-p", "/sdcard/screen.png"])
-                sh(["pull", "/sdcard/screen.png", "screen.png"])
-                return Image.open("screen.png")
-
-            def ask_ai(prompt, img):
-                try:
-                    r = model.generate_content([prompt, img], generation_config=genai.GenerationConfig(response_mime_type="application/json"))
-                    return json.loads(r.text)
-                except Exception as e:
-                    return None
-
-            bypass_js = """
-            Java.perform(function () {
-                try {
-                    var TMI = Java.use('com.android.org.conscrypt.TrustManagerImpl');
-                    TMI.checkTrustedRecursive.implementation = function () { return Java.use("java.util.ArrayList").$new(); };
-                } catch (e) {}
-                try {
-                    var CP = Java.use('okhttp3.CertificatePinner');
-                    CP.check.overload('java.lang.String', 'java.util.List').implementation = function() {};
-                } catch (e) {}
-            });
-            """
-            with open("bypass.js", "w") as f:
-                f.write(bypass_js)
-
-            # Start App mit Frida
-            subprocess.Popen(["frida", "-U", "-f", PACKAGE, "-l", "bypass.js", "--no-pause"], 
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print("Warte auf App-Initialisierung...")
-            time.sleep(10)
-
-            for step in range(15):
-                img = screenshot()
-                prompt_text = "Analysiere Screen. JSON: " + '{"action":"tap_email|tap_password|tap_login|wait|success|dismiss_dialog","x":N,"y":N,"reason":"..."}' + ". Regeln: Login -> Email -> Passwort -> Login. Dialog -> dismiss. Splash -> wait. Home -> success. Email: " + EMAIL + ", Password: " + PASSWORD
-                result = ask_ai(prompt_text, img)
-                if not result:
-                    time.sleep(2)
-                    continue
-                
-                a = result.get("action", "wait")
-                x = result.get("x", 0)
-                y = result.get("y", 0)
-                print(f"Step {step}: {a} at ({x},{y})")
-                
-                if a == "success":
-                    print("✅ Login erfolgreich!")
-                    break
-                if a == "wait":
-                    time.sleep(3)
-                    continue
-                if x > 0 and y > 0:
-                    sh(["shell", "input", "tap", str(x), str(y)])
-                    time.sleep(1)
-                    if a == "tap_email":
-                        sh(["shell", "input", "text", EMAIL])
-                        sh(["shell", "input", "keyevent", "66"])
-                    elif a == "tap_password":
-                        sh(["shell", "input", "text", PASSWORD])
-                        sh(["shell", "input", "keyevent", "66"])
-                    time.sleep(2)
-            
-            print("Warte auf finale Netzwerk-Requests...")
-            time.sleep(5)
-            PYEOF
-            
-            python3 ai_login.py
-
-      - name: Stop MITMProxy & Export Traffic
+      - name: Setup ADB and Global Proxy
         run: |
-          pkill -f mitmdump || true
+          REDROID_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' redroid)
+          echo "TARGET_DEVICE=${REDROID_IP}:5555" >> $GITHUB_ENV
+          echo "ANDROID_SERIAL=${REDROID_IP}:5555" >> $GITHUB_ENV
+
+          adb kill-server || true
+          adb start-server
+
+          for i in $(seq 1 45); do
+            adb connect "${REDROID_IP}:5555" || true
+            STATE=$(adb -s "${REDROID_IP}:5555" get-state 2>/dev/null | tr -d '\r')
+            [ "$STATE" = "device" ] && break
+            sleep 2
+          done
+          [ "$STATE" = "device" ] || { echo "::error::ADB-Verbindung fehlgeschlagen"; exit 1; }
+
+          for i in $(seq 1 90); do
+            BOOT=$(adb -s "${REDROID_IP}:5555" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            [ "$BOOT" = "1" ] && break
+            sleep 2
+          done
+
+          MITM_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' mitmproxy)
+          adb -s "${REDROID_IP}:5555" shell settings put global http_proxy "${MITM_IP}:8080"
+
+      - name: Start Frida Server & Install APK
+        run: |
+          FRIDA_VERSION=$(curl -s https://api.github.com/repos/frida/frida/releases/latest | jq -r .tag_name)
+          curl -L -o frida-server.xz "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-server-${FRIDA_VERSION}-android-x86_64.xz"
+          unxz -f frida-server.xz
+          chmod +x frida-server
+
+          adb -s "$TARGET_DEVICE" root 2>/dev/null || true
           sleep 3
-          
-          python3 << 'PYEOF'
-          import json, os, re
-          
-          flows = []
-          if os.path.exists("mitm_out/traffic.har"):
-              with open("mitm_out/traffic.har", "r") as f:
-                  har_data = json.load(f)
-                  for entry in har_data.get("log", {}).get("entries", []):
-                      req = entry.get("request", {})
-                      flows.append({
-                          "method": req.get("method"),
-                          "url": req.get("url"),
-                          "headers": {h["name"]: h["value"] for h in req.get("headers", [])},
-                          "body": req.get("postData", {}).get("text", "")
-                      })
-          
-          with open("traffic.json", "w") as f:
-              json.dump(flows, f, indent=2)
-          print(f"Exported {len(flows)} requests to traffic.json")
+          adb connect "$TARGET_DEVICE" || true
+          adb -s "$TARGET_DEVICE" wait-for-device
+
+          adb -s "$TARGET_DEVICE" push frida-server /data/local/tmp/
+          adb -s "$TARGET_DEVICE" shell "chmod 755 /data/local/tmp/frida-server"
+          adb -s "$TARGET_DEVICE" shell "nohup /data/local/tmp/frida-server > /data/local/tmp/frida.log 2>&1 &"
+          sleep 5
+
+          if [ ! -f "${{ env.APK_PATH }}" ]; then
+            git lfs pull || true
+          fi
+          adb -s "$TARGET_DEVICE" install -r -g "${{ env.APK_PATH }}" || {
+            adb -s "$TARGET_DEVICE" push "${{ env.APK_PATH }}" /data/local/tmp/app.apk
+            adb -s "$TARGET_DEVICE" shell pm install -r -d -t -g /data/local/tmp/app.apk
+            adb -s "$TARGET_DEVICE" shell rm -f /data/local/tmp/app.apk
+          }
+          adb -s "$TARGET_DEVICE" shell logcat -c
+
+      # ==========================================
+      # 🤖 TEIL 2: GEMINI VISION AI LOGIN AUTOMATION
+      # ==========================================
+      - name: AI Vision Login Agent (Gemini)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -x
+
+          nohup frida -D "$TARGET_DEVICE" -f "$PACKAGE" -l universal_ssl_bypass.js \
+                -o frida_output.log > frida_stdout.log 2>&1 &
+          FRIDA_PID=$!
+          sleep 12
+
+          # Der Vision Agent ersetzt den heuristischen uiautomator Agenten
+          cat > ai_vision_agent.py << 'PYEOF'
+import os, time, json, subprocess, base64
+import google.generativeai as genai
+from PIL import Image
+
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+model = genai.GenerativeModel("gemini-2.0-flash")
+
+SERIAL = os.environ["TARGET_DEVICE"]
+PACKAGE = os.environ["PACKAGE"]
+EMAIL = os.environ["TEST_EMAIL"]
+PASSWORD = os.environ["TEST_PASSWORD"]
+ADB = ["adb", "-s", SERIAL]
+
+def sh(args):
+    return subprocess.run(ADB + args, capture_output=True, text=True)
+
+def take_screenshot():
+    sh(["shell", "screencap", "-p", "/sdcard/screen.png"])
+    sh(["pull", "/sdcard/screen.png", "screen.png"])
+    return Image.open("screen.png")
+
+def ask_ai(prompt, img):
+    try:
+        response = model.generate_content(
+            [prompt, img],
+            generation_config=genai.GenerationConfig(response_mime_type="application/json")
+        )
+        return json.loads(response.text)
+    except Exception as e:
+        print(f"AI Error: {e}")
+        return None
+
+sh(["shell", "am", "force-stop", PACKAGE])
+time.sleep(2)
+sh(["shell", "monkey", "-p", PACKAGE, "1"])
+time.sleep(8)
+
+for step in range(15):
+    print(f"\n[Vision AI] Step {step}: Capturing screen...")
+    img = take_screenshot()
+    
+    prompt_text = "Analysiere diesen Android-Screenshot. Identifiziere UI-Elemente für den Login. "
+    prompt_text += "Gib NUR JSON zurück im Format: "
+    prompt_text += '{"action": "tap_email|tap_password|tap_login|wait|success|dismiss_dialog", "x": <pixel_x>, "y": <pixel_y>, "reason": "<text>"} '
+    prompt_text += "Regeln: "
+    prompt_text += "1. Login-Screen: Tippe Email-Feld, dann Passwort-Feld, dann Login-Button. "
+    prompt_text += "2. Dialog/Popup: Tippe Schließen-Button (dismiss_dialog). "
+    prompt_text += "3. Splash/Loading: Warte (wait, x=0, y=0). "
+    prompt_text += "4. Home/Dashboard sichtbar: Erfolg (success). "
+    prompt_text += f"Nutze diese Email: {EMAIL} und dieses Passwort: {PASSWORD}"
+    
+    result = ask_ai(prompt_text, img)
+    if not result:
+        time.sleep(3)
+        continue
+        
+    action = result.get("action", "wait")
+    x = result.get("x", 0)
+    y = result.get("y", 0)
+    reason = result.get("reason", "")
+    
+    print(f"🎯 Action: {action} at ({x},{y}) | Reason: {reason}")
+    
+    if action == "success":
+        print("✅ Login erfolgreich abgeschlossen!")
+        break
+    elif action == "wait":
+        time.sleep(4)
+        continue
+    elif action == "dismiss_dialog":
+        sh(["shell", "input", "tap", str(x), str(y)])
+        time.sleep(2)
+    elif action in ["tap_email", "tap_password", "tap_login"]:
+        if x > 0 and y > 0:
+            sh(["shell", "input", "tap", str(x), str(y)])
+            time.sleep(1)
+            if action == "tap_email":
+                sh(["shell", "input", "text", EMAIL])
+                sh(["shell", "input", "keyevent", "66"])
+            elif action == "tap_password":
+                sh(["shell", "input", "text", PASSWORD])
+                sh(["shell", "input", "keyevent", "66"])
+            time.sleep(2)
+
+print("Warte auf finale Netzwerk-Requests...")
+time.sleep(8)
           PYEOF
 
-      - name: APK Decompilation (Static Analysis)
+          python3 ai_vision_agent.py
+          kill $FRIDA_PID 2>/dev/null || true
+
+      # ==========================================
+      # 📦 TEIL 3: TRAFFIC EXPORT & APK DECOMPILATION
+      # ==========================================
+      - name: Export Complete Network Traffic
         run: |
-          echo "🔬 Decompiliere APK..."
+          echo "========================================="
+          echo "        EXPORTING COMPLETE TRAFFIC"
+          echo "========================================="
+          if [ -f "mitm_out/flows.mitm" ]; then
+            mitmdump -n -r mitm_out/flows.mitm --flow-detail 3 > traffic_complete.txt || true
+            
+            # JSON Export für die Analyse
+            python3 << 'PYEOF'
+import json, subprocess, re
+r = subprocess.run(["mitmdump", "-n", "-r", "mitm_out/flows.mitm", "--set", "flow_detail=3"], capture_output=True, text=True)
+flows, cur = [], None
+for line in r.stdout.split('\n'):
+    if '>>' in line and any(m in line for m in ['GET','POST','PUT']):
+        if cur: flows.append(cur)
+        m = re.search(r'>>\s+(\w+)\s+(.+)', line)
+        if m: cur = {'method': m.group(1), 'url': m.group(2), 'headers': {}, 'body': ''}
+    elif cur and ': ' in line and not line.startswith('    '):
+        k, v = line.split(': ', 1)
+        cur['headers'][k.strip()] = v.strip()
+    elif cur and line.strip() and not line.startswith('>>'):
+        cur['body'] += line + '\n'
+if cur: flows.append(cur)
+json.dump(flows, open('traffic.json','w'), indent=2)
+print(f"Exported {len(flows)} flows to traffic.json")
+            PYEOF
+          else
+            echo "Kein Traffic aufgezeichnet." > traffic_complete.txt
+            echo "[]" > traffic.json
+          fi
+
+      - name: APK Decompilation (apktool + jadx)
+        continue-on-error: true
+        run: |
+          echo "🔬 Decompiling APK for static code analysis..."
+          if [ ! -f "${{ env.APK_PATH }}" ]; then
+            echo "APK not found, skipping decompilation."
+            exit 0
+          fi
           wget -q https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar -O apktool.jar
           java -jar apktool.jar d "${{ env.APK_PATH }}" -o apktool-output -f || true
           
           wget -q https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip -O jadx.zip
           unzip -q jadx.zip -d jadx && chmod +x jadx/bin/jadx
-          ./jadx/bin/jadx -d jadx-output --show-bad-code "${{ env.APK_PATH }}"
+          ./jadx/bin/jadx -d jadx-output --show-bad-code "${{ env.APK_PATH }}" || true
 
-      - name: Deep Parameter Analysis & Validation
+      # ==========================================
+      # 🧠 TEIL 4: DEEP CODE ANALYSIS & VALIDATION
+      # ==========================================
+      - name: Deep Parameter Analysis
+        continue-on-error: true
+        run: |
+          cat > deep_analyzer.py << 'PYEOF'
+import os, re, json, glob
+traffic = json.load(open('traffic.json')) if os.path.exists('traffic.json') else []
+code_files = glob.glob("jadx-output/**/*.java", recursive=True) + glob.glob("apktool-output/smali*/**/*.smali", recursive=True)
+patterns = {
+    'timestamp': [r'System\.currentTimeMillis\(\)', r'new Date\(\)'],
+    'uuid': [r'UUID\.randomUUID\(\)'],
+    'nonce': [r'SecureRandom', r'Random\.nextBytes'],
+    'hash': [r'MessageDigest\.getInstance\(["\']([^"\']+)["\']\)'],
+    'hmac': [r'Mac\.getInstance\(["\']([^"\']+)["\']\)', r'HmacSHA'],
+    'signature': [r'Signature\.getInstance'],
+    'encryption': [r'Cipher\.getInstance', r'SecretKeySpec'],
+    'encoding': [r'Base64\.(encode|decode)', r'URLEncoder\.encode'],
+    'device_id': [r'Settings\.Secure\.ANDROID_ID', r'Build\.SERIAL'],
+    'network': [r'OkHttpClient', r'Retrofit', r'addInterceptor']
+}
+findings = {c: [] for c in patterns}
+for fp in code_files:
+    try:
+        with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        for cat, pats in patterns.items():
+            for pat in pats:
+                for m in re.finditer(pat, content, re.I):
+                    ctx = content[max(0,m.start()-500):min(len(content),m.end()+500)].strip()
+                    findings[cat].append({'file':fp,'pattern':pat,'context':ctx})
+    except: pass
+summary = {c: len(i) for c,i in findings.items()}
+json.dump({'findings':findings,'summary':summary,'traffic':traffic}, open('findings.json','w'), indent=2)
+print(f"Found {sum(summary.values())} crypto/network patterns")
+          PYEOF
+          python3 deep_analyzer.py
+
+      - name: Validate Generation Logic & Deep Re-Analysis
+        continue-on-error: true
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          cat > analyze_and_validate.py << 'PYEOF'
-          import os, re, json, glob, time, hashlib, hmac, uuid, secrets
-          from datetime import datetime
-          import google.generativeai as genai
+          cat > final_validation.py << 'PYEOF'
+import os, json, re, glob, time, hashlib, hmac, uuid, secrets
+from datetime import datetime
+import google.generativeai as genai
 
-          genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-          model = genai.GenerativeModel("gemini-2.0-flash")
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+model = genai.GenerativeModel("gemini-2.0-flash")
 
-          print("🧠 Starte Deep Analysis...")
-          
-          traffic = json.load(open("traffic.json")) if os.path.exists("traffic.json") else []
-          code_files = glob.glob("jadx-output/**/*.java", recursive=True) + glob.glob("apktool-output/smali*/**/*.smali", recursive=True)
-          
-          patterns = {
-              'timestamp': [r'System\.currentTimeMillis\(\)'],
-              'uuid': [r'UUID\.randomUUID\(\)'],
-              'nonce': [r'SecureRandom'],
-              'hash': [r'MessageDigest\.getInstance\(["\']([^"\']+)["\']\)'],
-              'hmac': [r'Mac\.getInstance\(["\']([^"\']+)["\']\)'],
-              'encryption': [r'SecretKeySpec', r'Cipher\.getInstance']
-          }
-          
-          findings = {c: [] for c in patterns}
-          for fp in code_files[:200]:
-              try:
-                  with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
-                      content = f.read()
-                  for cat, pats in patterns.items():
-                      for pat in pats:
-                          for m in re.finditer(pat, content, re.I):
-                              ctx = content[max(0,m.start()-400):min(len(content),m.end()+400)].strip()
-                              findings[cat].append({'file': fp, 'pattern': pat, 'context': ctx})
-              except: pass
-              
-          summary = {c: len(i) for c, i in findings.items()}
-          
-          reanalysis = []
-          login_req = next((f for f in traffic if any(k in f.get('url','').lower() for k in ['login','auth','token'])), None)
-          
-          if login_req and summary.get('hmac', 0) > 0:
-              prompt = f"""Du bist ein Android Reverse Engineering Experte.
-              App: {os.environ.get('PACKAGE')}
-              Login Request URL: {login_req.get('url')}
-              
-              Hier sind HMAC/Crypto Fundstellen im Code:
-              {chr(10).join([f['context'][:500] for f in findings['hmac'][:2]])}
-              
-              AUFGABE: Erkläre exakt, wie die Signatur generiert wird (Secret Key, Message-Reihenfolge, Algorithmus).
-              Gib einen Python-Code-Block zurück, der dies 1:1 repliziert.
-              
-              Antworte NUR im JSON-Format:
-              """ + '{"explanation": "...", "python_code": "...", "confidence": "high/medium/low"}'
-              
-              try:
-                  resp = model.generate_content([prompt], generation_config=genai.GenerationConfig(response_mime_type="application/json"))
-                  reanalysis.append(json.loads(resp.text))
-              except Exception as e:
-                  reanalysis.append({"error": str(e)})
+findings = json.load(open('findings.json')) if os.path.exists('findings.json') else {'findings':{},'summary':{},'traffic':[]}
+traffic = findings.get('traffic', [])
 
-          report = ["=" * 80, "CONFIRMED GENERATION LOGIC - FINAL REPORT", "=" * 80, f"Generated: {datetime.now()}", ""]
-          
-          report.append("SECTION 1: CODE ANALYSIS SUMMARY")
-          for cat, count in summary.items():
-              if count > 0: report.append(f"  - {cat.upper()}: {count} findings")
-          report.append("")
-          
-          report.append("SECTION 2: CAPTURED TRAFFIC (Login)")
-          if login_req:
-              report.append(f"URL: {login_req.get('url')}")
-              report.append(f"Method: {login_req.get('method')}")
-              report.append("Headers:")
-              for k, v in list(login_req.get('headers', {}).items())[:10]:
-                  report.append(f"  {k}: {v}")
-              report.append(f"Body: {login_req.get('body', '')[:500]}")
-          else:
-              report.append("No login traffic captured.")
-          report.append("")
-          
-          report.append("SECTION 3: AI REPLICATION LOGIC")
-          if reanalysis:
-              for i, res in enumerate(reanalysis):
-                  if "error" not in res:
-                      report.append(f"Analysis {i+1}:")
-                      report.append(f"Explanation: {res.get('explanation')}")
-                      report.append(f"Confidence: {res.get('confidence')}")
-                      report.append("Python Code:")
-                      report.append(res.get('python_code'))
-          else:
-              report.append("No specific replication logic generated (insufficient traffic or code matches).")
-          report.append("")
-          
-          report.append("=" * 80)
-          
-          with open("CONFIRMED_LOGIC.txt", "w", encoding="utf-8") as f:
-              f.write("\n".join(report))
-              
-          json.dump({"findings": findings, "summary": summary, "reanalysis": reanalysis, "traffic_sample": login_req}, 
-                    open("analysis_data.json", "w"), indent=2)
-          
-          print("✅ Analysis complete. Report saved to CONFIRMED_LOGIC.txt")
+login_req = next((f for f in traffic if any(k in f.get('url','').lower() for k in ['login','auth','token'])), None)
+
+report = []
+report.append("=" * 80)
+report.append("🔐 CONFIRMED GENERATION LOGIC - FINAL REPORT")
+report.append("=" * 80)
+report.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+report.append("")
+
+# 1. Traffic Analyse
+report.append("SECTION 1: CAPTURED LOGIN TRAFFIC")
+report.append("-" * 60)
+if login_req:
+    report.append(f"URL: {login_req.get('url')}")
+    report.append(f"Method: {login_req.get('method')}")
+    report.append("Headers:")
+    for k, v in list(login_req.get('headers', {}).items())[:15]:
+        report.append(f"  {k}: {v}")
+    report.append(f"Body: {login_req.get('body', '')[:500]}")
+else:
+    report.append("No login traffic captured.")
+report.append("")
+
+# 2. Code Analyse
+report.append("SECTION 2: CODE ANALYSIS SUMMARY")
+report.append("-" * 60)
+for cat, count in findings.get('summary', {}).items():
+    if count > 0: report.append(f"  - {cat.upper()}: {count} findings")
+report.append("")
+
+# 3. Gemini Deep Re-Analysis für Signaturen
+report.append("SECTION 3: AI REPLICATION LOGIC (Gemini Code Intelligence)")
+report.append("-" * 60)
+
+if login_req and findings['summary'].get('hmac', 0) > 0:
+    code_snippets = "\n\n".join([f"--- {f['file']} ---\n{f['context']}" for f in findings['findings'].get('hmac', [])[:2]])
+    
+    prompt = "Du bist ein Android Reverse Engineering Experte.\n\n"
+    prompt += f"App: {os.environ.get('PACKAGE')}\n"
+    prompt += f"Login URL: {login_req.get('url')}\n"
+    prompt += f"Beispiel Body: {login_req.get('body', '')[:300]}\n\n"
+    prompt += f"HMAC/Crypto Code Fundstellen:\n{code_snippets}\n\n"
+    prompt += "AUFGABE: Erkläre exakt, wie die Signatur/dynamischen Parameter generiert werden.\n"
+    prompt += "Gib Python-Code zurück, der dies 1:1 repliziert.\n\n"
+    prompt += "ANTWORTFORMAT (nur JSON):"
+    prompt += '{"explanation": "...", "python_code": "...", "secret_key": "...", "confidence": "high/medium/low"}'
+    
+    try:
+        resp = model.generate_content([prompt], generation_config=genai.GenerationConfig(response_mime_type="application/json"))
+        analysis = json.loads(resp.text)
+        report.append(f"Algorithm: {analysis.get('explanation', 'N/A')}")
+        report.append(f"Secret Key: {analysis.get('secret_key', 'Not found')}")
+        report.append(f"Confidence: {analysis.get('confidence', 'N/A')}")
+        report.append("\nPython Replikations-Code:")
+        report.append("```python")
+        report.append(analysis.get('python_code', '# No code generated'))
+        report.append("```")
+    except Exception as e:
+        report.append(f"AI Analysis Error: {e}")
+else:
+    report.append("No HMAC patterns found or no traffic to analyze.")
+
+report.append("\n" + "=" * 80)
+
+with open("CONFIRMED_LOGIC.txt", "w", encoding="utf-8") as f:
+    f.write("\n".join(report))
+print("✅ Final report generated: CONFIRMED_LOGIC.txt")
           PYEOF
-          
-          python3 analyze_and_validate.py
+          python3 final_validation.py
 
+      # ==========================================
+      # 💾 TEIL 5: ARTIFACTS & CLEANUP
+      # ==========================================
       - name: Save Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: apk-deep-analysis
+          name: ultimate-apk-analysis
           path: |
             CONFIRMED_LOGIC.txt
-            analysis_data.json
+            traffic_complete.txt
             traffic.json
-            mitm_out/traffic.har
+            findings.json
+            frida_output.log
+            screenshots/
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop redroid mitmproxy 2>/dev/null || true
+          docker rm redroid mitmproxy 2>/dev/null || true
+          docker network rm analysis-net 2>/dev/null || true
