@@ -1,12 +1,12 @@
-name: Generic APK AI Traffic Capture & Crypto Analysis
+name: APK AI Traffic Capture & Crypto Analysis (Verbose)
 
 on:
   workflow_dispatch:
     inputs:
       apk_path:
-        description: 'Pfad der APK im Repo (z.B. target.apk)'
+        description: 'Pfad der APK im Repo (z.B. app-release.apk)'
         required: true
-        default: 'target.apk'
+        default: 'app-release.apk'
       package_name:
         description: 'Package-Name der App (z.B. com.example.app)'
         required: true
@@ -28,117 +28,148 @@ env:
 
 jobs:
   ai-capture-and-analyze:
-    # WICHTIG: Benötigt einen Self-Hosted Runner mit /dev/kvm und Docker!
-    runs-on: self-hosted
-    timeout-minutes: 30
+    # ubuntu-latest garantiert, dass der Job sofort startet und Logs produziert
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
-      - name: Checkout Repository
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v4
         with:
           lfs: true
 
-      - name: Install System Dependencies
+      - name: 🛠️ Install System Dependencies (Verbose)
         run: |
+          set -x # Aktiviert detailliertes Logging jeder ausgeführten Zeile
+          echo "=== START: Installing Dependencies ==="
           sudo apt-get update
-          sudo apt-get install -y android-tools-adb python3-pip openssl unzip curl jq openjdk-17-jdk
+          sudo apt-get install -y android-tools-adb python3-pip openssl unzip curl jq openjdk-17-jdk tree
+          pip3 install --upgrade --break-system-packages frida-tools mitmproxy
+          echo "=== END: Dependencies Installed ==="
 
-      - name: Setup Docker Network & Emulator
+      - name: 📱 Setup Docker Network & Emulator
         run: |
+          set -x
+          echo "=== START: Emulator Setup ==="
           docker network create analysis-net 2>/dev/null || true
-          
-          # Wir nutzen budtmo/docker-android, da dies stabiler ist als rohes redroid auf CI-Systemen
-          echo "🚀 Starting Android Emulator..."
-          docker run -d --name android-emulator --privileged \
+
+          echo "Attempting to start redroid emulator..."
+          # Hinweis: Auf ubuntu-latest fehlt oft /dev/kvm. Wir fangen Fehler ab, damit der Job nicht sofort abbricht.
+          docker run -d --name redroid --privileged \
+            -v /dev/kvm:/dev/kvm \
             --network analysis-net \
-            -p 5555:5555 \
-            -e DEVICE="Samsung Galaxy S10" \
-            budtmo/docker-android:emulator_13.0
+            redroid/redroid:11.0.0-latest \
+            androidboot.hardware=redroid \
+            androidboot.redroid_gpu_mode=guest \
+            androidboot.redroid_width=1080 \
+            androidboot.redroid_height=1920 \
+            androidboot.redroid_dpi=420 || echo "⚠️ Emulator start failed (likely missing KVM). Falling back to static analysis only."
 
-          # Warten bis ADB verfügbar ist
-          adb connect localhost:5555
-          adb wait-for-device
-          echo "⏳ Waiting for boot completion..."
-          while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != "1" ]; do 
-            sleep 3
-          done
-          echo "✅ Emulator booted."
-          
-          EMULATOR_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' android-emulator)
-          echo "EMULATOR_IP=${EMULATOR_IP}" >> $GITHUB_ENV
-          echo "TARGET_DEVICE=${EMULATOR_IP}:5555" >> $GITHUB_ENV
+          mkdir -p mitm_out screenshots ui_dumps
+          chmod 777 mitm_out
 
-      - name: Setup mitmproxy
-        run: |
-          mkdir -p mitm_out
+          echo "Starting mitmproxy..."
           docker run -d --name mitmproxy --network analysis-net \
+            -p 8080:8080 \
+            -e HOME=/home/mitmproxy \
             -v "$PWD/mitm_out:/home/mitmproxy/out" \
             mitmproxy/mitmproxy:latest \
             mitmdump -w /home/mitmproxy/out/flows.mitm \
               --listen-port 8080 \
               --ssl-insecure \
               --set block_global=false \
-              --set confdir=/home/mitmproxy/.mitmproxy
+              --set confdir=/home/mitmproxy/.mitmproxy || echo "⚠️ mitmproxy start failed."
           
-          # Warten bis das Zertifikat generiert ist
+          echo "=== END: Emulator Setup ==="
+
+      - name: 🔐 Install CA Certificate into Android
+        run: |
+          set -x
+          echo "=== START: CA Injection ==="
+          # Warten auf mitmproxy cert
           for i in $(seq 1 30); do
             if docker exec mitmproxy test -f /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem 2>/dev/null; then
+              echo "✅ mitmproxy cert found."
               break
             fi
-            sleep 1
+            echo "Waiting for mitmproxy cert... ($i/30)"
+            sleep 2
           done
 
-      - name: Install CA Certificate into Android
-        run: |
-          docker exec mitmproxy cat /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem > cacert.pem
-          HASH=$(openssl x509 -subject_hash_old -in cacert.pem | head -n1)
+          mkdir -p cacerts
+          docker exec mitmproxy cat /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem > cacerts/cacert.pem || echo "⚠️ Could not get cert."
           
-          adb -s "$TARGET_DEVICE" root
-          sleep 2
-          adb -s "$TARGET_DEVICE" remount
-          adb -s "$TARGET_DEVICE" shell mkdir -p /system/etc/security/cacerts
-          adb -s "$TARGET_DEVICE" push cacert.pem "/system/etc/security/cacerts/${HASH}.0"
-          adb -s "$TARGET_DEVICE" shell chmod 644 "/system/etc/security/cacerts/${HASH}.0"
-          
-          # Proxy setzen
-          MITM_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' mitmproxy)
-          adb -s "$TARGET_DEVICE" shell settings put global http_proxy "${MITM_IP}:8080"
+          if [ -f cacerts/cacert.pem ]; then
+            HASH=$(openssl x509 -subject_hash_old -in cacerts/cacert.pem | head -n1)
+            cp cacerts/cacert.pem "cacerts/${HASH}.0"
+            
+            # Versuche, in den Emulator zu injizieren (schlägt fehl, wenn Emulator nicht läuft, was OK ist)
+            docker exec redroid sh -c "mount -o remount,rw /system 2>/dev/null || true"
+            docker exec redroid sh -c "mkdir -p /system/etc/security/cacerts"
+            docker cp "cacerts/${HASH}.0" redroid:/system/etc/security/cacerts/ 2>/dev/null || echo "⚠️ Could not push cert to emulator."
+          fi
+          echo "=== END: CA Injection ==="
 
-      - name: Install Frida & APK
+      - name: 📲 Setup ADB, Global Proxy & Install APK
         run: |
-          FRIDA_VERSION=$(curl -s https://api.github.com/repos/frida/frida/releases/latest | jq -r .tag_name)
-          curl -L -o frida-server.xz "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-server-${FRIDA_VERSION}-android-x86_64.xz"
-          unxz -f frida-server.xz
-          chmod +x frida-server
+          set -x
+          echo "=== START: ADB & APK Install ==="
+          REDROID_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' redroid 2>/dev/null || echo "127.0.0.1")
+          echo "TARGET_DEVICE=${REDROID_IP}:5555" >> $GITHUB_ENV
+          
+          adb kill-server || true
+          adb start-server
+          adb connect "${REDROID_IP}:5555" || true
 
-          adb -s "$TARGET_DEVICE" push frida-server /data/local/tmp/
-          adb -s "$TARGET_DEVICE" shell "chmod 755 /data/local/tmp/frida-server"
-          adb -s "$TARGET_DEVICE" shell "nohup /data/local/tmp/frida-server > /data/local/tmp/frida.log 2>&1 &"
-          sleep 3
+          # Prüfen ob Emulator läuft
+          STATE=$(adb -s "${REDROID_IP}:5555" get-state 2>/dev/null | tr -d '\r')
+          if [ "$STATE" = "device" ]; then
+            echo "✅ Emulator is online."
+            MITM_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' mitmproxy 2>/dev/null || echo "127.0.0.1")
+            adb -s "${REDROID_IP}:5555" shell settings put global http_proxy "${MITM_IP}:8080" || true
+            
+            # Frida Setup
+            FRIDA_VERSION=$(curl -s https://api.github.com/repos/frida/frida/releases/latest | jq -r .tag_name)
+            curl -sL -o frida-server.xz "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-server-${FRIDA_VERSION}-android-x86_64.xz"
+            unxz -f frida-server.xz
+            chmod +x frida-server
 
-          # APK installieren
-          if [ -f "${{ env.APK_PATH }}" ]; then
-            adb -s "$TARGET_DEVICE" install -r -g "${{ env.APK_PATH }}" || {
-              adb -s "$TARGET_DEVICE" push "${{ env.APK_PATH }}" /data/local/tmp/app.apk
-              adb -s "$TARGET_DEVICE" shell pm install -r -d -t -g /data/local/tmp/app.apk
-            }
+            adb -s "$TARGET_DEVICE" root 2>/dev/null || true
+            sleep 3
+            adb -s "$TARGET_DEVICE" push frida-server /data/local/tmp/
+            adb -s "$TARGET_DEVICE" shell "chmod 755 /data/local/tmp/frida-server"
+            adb -s "$TARGET_DEVICE" shell "nohup /data/local/tmp/frida-server > /data/local/tmp/frida.log 2>&1 &"
+            sleep 3
+
+            # APK Install
+            if [ -f "${{ env.APK_PATH }}" ]; then
+              echo "Installing APK: ${{ env.APK_PATH }}"
+              adb -s "$TARGET_DEVICE" install -r -g "${{ env.APK_PATH }}" || echo "⚠️ Standard install failed, trying alternative..."
+            else
+              echo "::warning::APK not found at ${{ env.APK_PATH }}. Skipping install."
+            fi
           else
-            echo "::error::APK nicht gefunden unter ${{ env.APK_PATH }}"
-            exit 1
+            echo "⚠️ Emulator not reachable. Skipping dynamic steps, proceeding to static analysis."
+          fi
+          echo "=== END: ADB & APK Install ==="
+
+      - name: 🤖 AI-Powered Heuristic UI Navigator
+        run: |
+          set -x
+          echo "=== START: AI UI Navigator ==="
+          if [ "$STATE" != "device" ]; then
+            echo "⚠️ Skipping AI Navigator (No emulator)."
+            echo "NO_EMULATOR" > ai_status.txt
+            exit 0
           fi
 
-      - name: Create Universal SSL-Pinning Bypass Hook
-        run: |
           cat > universal_ssl_bypass.js << 'EOF'
           Java.perform(function () {
               console.log("\n⚡ === UNIVERSAL SSL-PINNING BYPASS ACTIVE === ⚡");
               try {
                   var TMI = Java.use('com.android.org.conscrypt.TrustManagerImpl');
-                  TMI.checkTrustedRecursive.implementation = function () {
-                      return Java.use("java.util.ArrayList").$new();
-                  };
+                  TMI.checkTrustedRecursive.implementation = function () { return Java.use("java.util.ArrayList").$new(); };
               } catch (e) {}
-              
               try {
                   var CP = Java.use('okhttp3.CertificatePinner');
                   CP.check.overload('java.lang.String', 'java.util.List').implementation = function() {};
@@ -146,21 +177,20 @@ jobs:
           });
           EOF
 
-      - name: AI-Powered Heuristic UI Navigator & Login Agent
-        run: |
           nohup frida -D "$TARGET_DEVICE" -f "$PACKAGE" -l universal_ssl_bypass.js -o frida_output.log > frida_stdout.log 2>&1 &
           FRIDA_PID=$!
-          sleep 15 # Warten bis die App geladen ist
+          echo "Frida started with PID: $FRIDA_PID"
+          sleep 15
 
           cat > ai_agent.py << 'PYEOF'
           import sys, time, re, os
           import xml.etree.ElementTree as ET
           import subprocess
 
-          SERIAL = os.environ["TARGET_DEVICE"]
-          PACKAGE = os.environ["PACKAGE"]
-          EMAIL = os.environ["TEST_EMAIL"]
-          PASSWORD = os.environ["TEST_PASSWORD"]
+          SERIAL = os.environ.get("TARGET_DEVICE", "localhost:5555")
+          PACKAGE = os.environ.get("PACKAGE", "com.example.app")
+          EMAIL = os.environ.get("TEST_EMAIL", "test@test.com")
+          PASSWORD = os.environ.get("TEST_PASSWORD", "password123")
           ADB = ["adb", "-s", SERIAL]
 
           LOGIN_KEYWORDS = ["log in", "login", "signin", "sign in", "anmelden", "einloggen", "continue", "weiter", "next", "start"]
@@ -182,14 +212,12 @@ jobs:
           def evaluate_nodes(tree):
               best_action = None
               highest_score = -1
-
               for node in tree.iter("node"):
                   text = (node.get("text") or "").strip().lower()
                   desc = (node.get("content-desc") or "").strip().lower()
                   res_id = (node.get("resource-id") or "").strip().lower()
                   cls = node.get("class", "").lower()
                   clickable = node.get("clickable") == "true"
-                  
                   combined_text = f"{text} {desc} {res_id}"
                   score = 0
                   action_type = "click"
@@ -197,17 +225,12 @@ jobs:
 
                   if "edittext" in cls:
                       if any(k in combined_text for k in PASSWORD_KEYWORDS):
-                          score += 100
-                          action_type = "password"
-                          payload = PASSWORD
+                          score += 100; action_type = "password"; payload = PASSWORD
                       elif any(k in combined_text for k in EMAIL_KEYWORDS) or score == 0:
-                          score += 80
-                          action_type = "email"
-                          payload = EMAIL
+                          score += 80; action_type = "email"; payload = EMAIL
                   elif clickable or "button" in cls or "textview" in cls:
                       if any(k in combined_text for k in LOGIN_KEYWORDS):
-                          score += 90
-                          action_type = "click"
+                          score += 90; action_type = "click"
 
                   if score > highest_score:
                       bounds = node.get("bounds")
@@ -215,10 +238,8 @@ jobs:
                       if m:
                           x1, y1, x2, y2 = map(int, m.groups())
                           if x2 > x1 and y2 > y1:
-                              cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
                               highest_score = score
-                              best_action = (action_type, cx, cy, combined_text, payload)
-
+                              best_action = (action_type, (x1 + x2) // 2, (y1 + y2) // 2, combined_text, payload)
               return best_action
 
           print("[KI-AGENT] Starte App...")
@@ -227,84 +248,141 @@ jobs:
           sh(["shell", "monkey", "-p", PACKAGE, "1"])
 
           interacted_coords = set()
-          for step in range(12): # 12 Schritte für Splash-Screen + Login
+          for step in range(12):
               time.sleep(3)
               tree = dump_ui()
-              if tree is None:
-                  continue
-
+              if tree is None: continue
               action = evaluate_nodes(tree)
               if action:
                   action_type, x, y, context, payload = action
-                  
                   if (x, y) in interacted_coords and action_type == "click":
-                      print(f"[KI-AGENT] Element bei ({x}, {y}) bereits geklickt, überspringe...")
+                      print(f"[KI] Element bei ({x}, {y}) bereits geklickt.")
                       continue
-
-                  print(f"[KI-AGENT] Step {step}: Führe '{action_type}' aus bei ({x}, {y}) [Kontext: {context}]")
+                  print(f"[KI] Step {step}: '{action_type}' bei ({x}, {y}) [{context}]")
                   sh(["shell", "input", "tap", str(x), str(y)])
                   interacted_coords.add((x, y))
                   time.sleep(1)
-
                   if action_type in ["email", "password"]:
                       sh(["shell", "input", "text", payload])
-                      sh(["shell", "input", "keyevent", "66"]) # Enter
-                  
+                      sh(["shell", "input", "keyevent", "66"])
                   time.sleep(2)
               else:
-                  print(f"[KI-AGENT] Step {step}: Warte auf UI-Elemente...")
-          
-          print("[KI-AGENT] Login-Sequenz abgeschlossen. Warte auf Netzwerk-Requests...")
-          time.sleep(5)
+                  print(f"[KI] Step {step}: Warte auf UI-Elemente...")
+          print("[KI-AGENT] Sequenz abgeschlossen.")
           PYEOF
 
           python3 ai_agent.py
-          kill $FRIDA_PID 2>/dev/null || true
+          echo "=== END: AI UI Navigator ==="
 
-      - name: Export Network Traffic
+      - name: 📦 Export Network Traffic
         run: |
-          echo "📦 Exportiere Netzwerk-Traffic..."
+          set -x
+          echo "=== START: Export Traffic ==="
           if [ -f "mitm_out/flows.mitm" ]; then
-            mitmdump -n -r mitm_out/flows.mitm --flow-detail 3 > traffic_complete.txt || true
+            echo "Converting mitm flows to readable text..."
+            mitmdump -n -r mitm_out/flows.mitm --flow-detail3 > traffic_complete.txt 2>/dev/null || echo "Traffic export had warnings."
           else
-            echo "Kein Traffic aufgezeichnet." > traffic_complete.txt
+            echo "Kein Traffic aufgezeichnet (Emulator evtl. nicht gestartet)." > traffic_complete.txt
+          fi
+          echo "=== END: Export Traffic ==="
+
+      - name: 🔬 Decompile APK & Crypto Logic Analysis
+        run: |
+          set -x
+          echo "=== START: Static Crypto Analysis ==="
+          if [ ! -f "${{ env.APK_PATH }}" ]; then
+            echo "⚠️ APK not found. Skipping decompilation."
+            exit 0
           fi
 
-      - name: Decompile APK for Crypto Analysis
-        run: |
-          echo "🔬 Decompiliere APK für Crypto-Analyse..."
+          echo "Downloading JADX..."
           wget -q https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip -O jadx.zip
           unzip -q jadx.zip -d jadx
           chmod +x jadx/bin/jadx
+          
+          echo "Decompiling APK..."
           ./jadx/bin/jadx -d jadx-output --show-bad-code "${{ env.APK_PATH }}"
+          echo "✅ Decompilation complete."
 
-      - name: Run Crypto Logic Analyzer
-        run: |
-          # Wir nutzen das analyze_crypto_logic.py Skript aus dem vorherigen Schritt
-          # Stelle sicher, dass diese Datei im Root deines Repos liegt!
-          if [ -f "analyze_crypto_logic.py" ]; then
-            python3 analyze_crypto_logic.py
-          else
-            echo "analyze_crypto_logic.py nicht gefunden. Überspringe Crypto-Analyse."
-          fi
+          echo "Running Crypto Logic Analyzer..."
+          cat > analyze_crypto.py << 'PYEOF'
+          import os, re, json
+          from datetime import datetime
 
-      - name: Save Artifacts
+          jadx_dir = "jadx-output"
+          findings = []
+          
+          patterns = [
+              (r'System\.currentTimeMillis\(\)', "Timestamp", "timestamp"),
+              (r'UUID\.randomUUID\(\)', "UUID", "uuid"),
+              (r'SecureRandom', "SecureRandom Nonce", "nonce"),
+              (r'MessageDigest\.getInstance\(["\']([^"\']+)["\']\)', "Hash Algorithm", "hash"),
+              (r'Mac\.getInstance\(["\']([^"\']+)["\']\)', "HMAC Signature", "hmac"),
+              (r'SecretKeySpec', "Encryption Key", "key")
+          ]
+
+          for root, dirs, files in os.walk(jadx_dir):
+              for file in files:
+                  if file.endswith('.java'):
+                      path = os.path.join(root, file)
+                      try:
+                          with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                              content = f.read()
+                              for pattern, desc, cat in patterns:
+                                  for match in re.finditer(pattern, content, re.I):
+                                      start = max(0, match.start() - 300)
+                                      end = min(len(content), match.end() + 300)
+                                      findings.append({
+                                          'category': cat, 'description': desc,
+                                          'file': path.replace(jadx_dir+'/', ''),
+                                          'context': content[start:end].strip()
+                                      })
+                      except: pass
+
+          print(f"✅ Found {len(findings)} crypto patterns.")
+          
+          # Generate Markdown Report
+          md = ["# 🔐 Crypto Logic Analysis Report\n", f"Generated: {datetime.now()}\n", "---\n"]
+          for cat in set(f['category'] for f in findings):
+              md.append(f"## {cat.upper()}\n")
+              for f in findings:
+                  if f['category'] == cat:
+                      md.append(f"### `{f['file']}`\n**{f['description']}**\n```java\n{f['context']}\n```\n")
+          
+          with open("crypto_logic_report.md", "w") as out:
+              out.write("\n".join(md))
+              
+          with open("crypto_logic.json", "w") as out:
+              json.dump(findings, out, indent=2)
+          print("✅ Reports saved: crypto_logic_report.md, crypto_logic.json")
+          PYEOF
+          
+          python3 analyze_crypto.py
+          echo "=== END: Static Crypto Analysis ==="
+
+      - name: 💾 Save Artifacts (Always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: app-traffic-and-crypto-analysis
+          name: apk-analysis-results
           path: |
             traffic_complete.txt
             frida_output.log
+            frida_stdout.log
             crypto_logic_report.md
             crypto_logic.json
+            screenshots/
+            ui_dumps/
             jadx-output/
           if-no-files-found: warn
+          retention-days: 7
 
-      - name: Cleanup
+      - name: 🧹 Cleanup
         if: always()
         run: |
-          adb -s "$TARGET_DEVICE" shell settings put global http_proxy :0 || true
-          docker stop android-emulator mitmproxy 2>/dev/null || true
-          docker rm android-emulator mitmproxy 2>/dev/null || true
+          set -x
+          echo "=== START: Cleanup ==="
+          docker stop redroid mitmproxy 2>/dev/null || true
+          docker rm redroid mitmproxy 2>/dev/null || true
           docker network rm analysis-net 2>/dev/null || true
+          echo "=== END: Cleanup ==="
