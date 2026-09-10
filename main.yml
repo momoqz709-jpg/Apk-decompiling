@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       package_name:
-        description: 'App Package Name (e.g., com.example.app)'
+        description: com.boosteroid.streaming
         required: true
         type: string
 
