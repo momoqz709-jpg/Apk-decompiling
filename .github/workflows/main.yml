@@ -32,20 +32,20 @@ jobs:
     timeout-minutes: 75
 
     steps:
-      - name: 📥 Checkout Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           lfs: true
 
-      - name: 🛠️ Install Dependencies
+      - name: Install Dependencies
         run: |
           set -x
           sudo apt-get update
           sudo apt-get install -y android-tools-adb python3-pip openssl unzip curl jq openjdk-17-jdk
           pip3 install --upgrade --break-system-packages frida-tools mitmproxy google-generativeai Pillow requests
-          echo "=== Dependencies installed ==="
+          echo "Dependencies installed"
 
-      - name: 📱 Setup Emulator & Proxy
+      - name: Setup Emulator & Proxy
         run: |
           set -x
           docker network create analysis-net 2>/dev/null || true
@@ -57,7 +57,7 @@ jobs:
             androidboot.redroid_gpu_mode=guest \
             androidboot.redroid_width=1080 \
             androidboot.redroid_height=1920 \
-            androidboot.redroid_dpi=420 || { echo "⚠️ Emulator failed"; exit 0; }
+            androidboot.redroid_dpi=420 || { echo "Emulator failed"; exit 0; }
 
           sleep 15
           CONTAINER_STATUS=$(docker inspect -f '{{.State.Status}}' redroid 2>/dev/null || echo "unknown")
@@ -74,7 +74,7 @@ jobs:
               --listen-port 8080 --ssl-insecure \
               --set block_global=false --set confdir=/home/mitmproxy/.mitmproxy
 
-      - name: 🔐 CA Injection & ADB Setup
+      - name: CA Injection & ADB Setup
         run: |
           set -x
           for i in $(seq 1 60); do
@@ -103,7 +103,10 @@ jobs:
             adb connect "${REDROID_IP}:5555" || true
             sleep 3
             STATE=$(adb -s "${REDROID_IP}:5555" get-state 2>/dev/null | tr -d '\r' || echo "")
-            [ "$STATE" = "device" ] && CONNECTED=true && break
+            if [ "$STATE" = "device" ]; then
+              CONNECTED=true
+              break
+            fi
             sleep $((attempt * 2))
           done
 
@@ -114,9 +117,13 @@ jobs:
 
           for i in $(seq 1 120); do
             STATE=$(adb -s "${REDROID_IP}:5555" get-state 2>/dev/null | tr -d '\r' || echo "")
-            [ "$STATE" != "device" ] && adb connect "${REDROID_IP}:5555" >/dev/null 2>&1 || true
+            if [ "$STATE" != "device" ]; then
+              adb connect "${REDROID_IP}:5555" >/dev/null 2>&1 || true
+            fi
             BOOT=$(adb -s "${REDROID_IP}:5555" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n ' || echo "")
-            [ "$BOOT" = "1" ] && break
+            if [ "$BOOT" = "1" ]; then
+              break
+            fi
             sleep 1
           done
 
@@ -130,10 +137,12 @@ jobs:
           MITM_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' mitmproxy)
           adb -s "${REDROID_IP}:5555" shell settings put global http_proxy "${MITM_IP}:8080"
 
-      - name: 📲 Install Frida & APK
+      - name: Install Frida & APK
         run: |
           set -x
-          [ "${{ env.TARGET_DEVICE }}" = "none" ] || [ ! -f "${{ env.APK_PATH }}" ] && exit 0
+          if [ "${{ env.TARGET_DEVICE }}" = "none" ] || [ ! -f "${{ env.APK_PATH }}" ]; then
+            exit 0
+          fi
 
           FRIDA_VERSION=$(curl -s https://api.github.com/repos/frida/frida/releases/latest | jq -r .tag_name)
           curl -sL -o frida-server.xz "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-server-${FRIDA_VERSION}-android-x86_64.xz"
@@ -149,12 +158,14 @@ jobs:
             adb -s "$TARGET_DEVICE" shell pm install -r -d -t -g /data/local/tmp/app.apk
           }
 
-      - name: 🤖 AI Vision Login
+      - name: AI Vision Login
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           set -x
-          [ "${{ env.TARGET_DEVICE }}" = "none" ] && exit 0
+          if [ "${{ env.TARGET_DEVICE }}" = "none" ]; then
+            exit 0
+          fi
 
           cat > universal_ssl_bypass.js << 'EOF'
           Java.perform(function () {
@@ -175,367 +186,300 @@ jobs:
           sleep 15
 
           cat > ai_login_agent.py << 'PYEOF'
-          import os, time, json, subprocess
-          import google.generativeai as genai
-          from PIL import Image
+import os, time, json, subprocess
+import google.generativeai as genai
+from PIL import Image
 
-          genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-          model = genai.GenerativeModel("gemini-2.0-flash")
-          SERIAL = os.environ.get("TARGET_DEVICE")
-          PACKAGE = os.environ.get("PACKAGE")
-          EMAIL = os.environ.get("TEST_EMAIL")
-          PASSWORD = os.environ.get("TEST_PASSWORD")
-          ADB = ["adb", "-s", SERIAL]
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+model = genai.GenerativeModel("gemini-2.0-flash")
+SERIAL = os.environ.get("TARGET_DEVICE")
+PACKAGE = os.environ.get("PACKAGE")
+EMAIL = os.environ.get("TEST_EMAIL")
+PASSWORD = os.environ.get("TEST_PASSWORD")
+ADB = ["adb", "-s", SERIAL]
 
-          def sh(args):
-              return subprocess.run(ADB + args, capture_output=True, text=True)
+def sh(args):
+    return subprocess.run(ADB + args, capture_output=True, text=True)
 
-          def screenshot():
-              sh(["shell", "screencap", "-p", "/sdcard/screen.png"])
-              sh(["pull", "/sdcard/screen.png", "screen.png"])
-              return Image.open("screen.png")
+def screenshot():
+    sh(["shell", "screencap", "-p", "/sdcard/screen.png"])
+    sh(["pull", "/sdcard/screen.png", "screen.png"])
+    return Image.open("screen.png")
 
-          def ask_ai(prompt, img):
-              try:
-                  r = model.generate_content([prompt, img], generation_config=genai.GenerationConfig(response_mime_type="application/json"))
-                  return json.loads(r.text)
-              except: return None
+def ask_ai(prompt, img):
+    try:
+        r = model.generate_content([prompt, img], generation_config=genai.GenerationConfig(response_mime_type="application/json"))
+        return json.loads(r.text)
+    except:
+        return None
 
-          sh(["shell", "am", "force-stop", PACKAGE])
-          time.sleep(2)
-          sh(["shell", "monkey", "-p", PACKAGE, "1"])
-          time.sleep(5)
+sh(["shell", "am", "force-stop", PACKAGE])
+time.sleep(2)
+sh(["shell", "monkey", "-p", PACKAGE, "1"])
+time.sleep(5)
 
-          for step in range(15):
-              img = screenshot()
-              result = ask_ai(f"""Analysiere Screen. JSON: {{"action":"tap_email|tap_password|tap_login|wait|success|dismiss_dialog","x":N,"y":N,"reason":"..."}}
-              Regeln: Login-Screen → Email → Passwort → Login-Button. Dialog → dismiss. Splash → wait. Home → success.
-              Email: {EMAIL}, Password: {PASSWORD}""", img)
-              if not result: continue
-              a, x, y = result.get("action","wait"), result.get("x",0), result.get("y",0)
-              print(f"Step {step}: {a} at ({x},{y})")
-              if a == "success": break
-              if a == "wait": time.sleep(3); continue
-              if x > 0 and y > 0:
-                  sh(["shell", "input", "tap", str(x), str(y)])
-                  time.sleep(1)
-                  if a == "tap_email":
-                      sh(["shell", "input", "text", EMAIL])
-                      sh(["shell", "input", "keyevent", "66"])
-                  elif a == "tap_password":
-                      sh(["shell", "input", "text", PASSWORD])
-                      sh(["shell", "input", "keyevent", "66"])
-                  time.sleep(2)
-          PYEOF
+for step in range(15):
+    img = screenshot()
+    result = ask_ai(f"Analysiere Screen. JSON: {{'action':'tap_email|tap_password|tap_login|wait|success|dismiss_dialog','x':N,'y':N,'reason':'...'}}. Regeln: Login-Screen -> Email -> Passwort -> Login-Button. Dialog -> dismiss. Splash -> wait. Home -> success. Email: {EMAIL}, Password: {PASSWORD}", img)
+    if not result:
+        continue
+    a = result.get("action", "wait")
+    x = result.get("x", 0)
+    y = result.get("y", 0)
+    print(f"Step {step}: {a} at ({x},{y})")
+    if a == "success":
+        break
+    if a == "wait":
+        time.sleep(3)
+        continue
+    if x > 0 and y > 0:
+        sh(["shell", "input", "tap", str(x), str(y)])
+        time.sleep(1)
+        if a == "tap_email":
+            sh(["shell", "input", "text", EMAIL])
+            sh(["shell", "input", "keyevent", "66"])
+        elif a == "tap_password":
+            sh(["shell", "input", "text", PASSWORD])
+            sh(["shell", "input", "keyevent", "66"])
+        time.sleep(2)
+PYEOF
 
           python3 ai_login_agent.py
           sleep 10
           kill $FRIDA_PID 2>/dev/null || true
 
-      - name: 📦 Export Traffic
+      - name: Export Traffic
         run: |
           set -x
           if [ -f "mitm_out/flows.mitm" ]; then
             mitmdump -n -r mitm_out/flows.mitm --flow-detail 3 > traffic_complete.txt 2>/dev/null || true
             
             python3 << 'PYEOF'
-          import json, subprocess, re
-          r = subprocess.run(["mitmdump", "-n", "-r", "mitm_out/flows.mitm", "--set", "flow_detail=3"], capture_output=True, text=True)
-          flows, cur = [], None
-          for line in r.stdout.split('\n'):
-              if '>>' in line and any(m in line for m in ['GET','POST','PUT']):
-                  if cur: flows.append(cur)
-                  m = re.search(r'>>\s+(\w+)\s+(.+)', line)
-                  if m: cur = {'method': m.group(1), 'url': m.group(2), 'headers': {}, 'body': ''}
-              elif cur and ': ' in line and not line.startswith('    '):
-                  k, v = line.split(': ', 1); cur['headers'][k.strip()] = v.strip()
-              elif cur and line.strip() and not line.startswith('>>'):
-                  cur['body'] += line + '\n'
-          if cur: flows.append(cur)
-          json.dump(flows, open('traffic.json','w'), indent=2)
-          print(f"✅ {len(flows)} flows exported")
-          PYEOF
+import json, subprocess, re
+r = subprocess.run(["mitmdump", "-n", "-r", "mitm_out/flows.mitm", "--set", "flow_detail=3"], capture_output=True, text=True)
+flows, cur = [], None
+for line in r.stdout.split('\n'):
+    if '>>' in line and any(m in line for m in ['GET','POST','PUT']):
+        if cur:
+            flows.append(cur)
+        m = re.search(r'>>\s+(\w+)\s+(.+)', line)
+        if m:
+            cur = {'method': m.group(1), 'url': m.group(2), 'headers': {}, 'body': ''}
+    elif cur and ': ' in line and not line.startswith('    '):
+        k, v = line.split(': ', 1)
+        cur['headers'][k.strip()] = v.strip()
+    elif cur and line.strip() and not line.startswith('>>'):
+        cur['body'] += line + '\n'
+if cur:
+    flows.append(cur)
+json.dump(flows, open('traffic.json','w'), indent=2)
+print(f"Exported {len(flows)} flows")
+PYEOF
           else
             echo "[]" > traffic.json
           fi
 
-      - name: 🔬 APK Decompilation
+      - name: APK Decompilation
         run: |
           set -x
-          [ ! -f "${{ env.APK_PATH }}" ] && exit 0
+          if [ ! -f "${{ env.APK_PATH }}" ]; then
+            exit 0
+          fi
           wget -q https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar -O apktool.jar
           java -jar apktool.jar d "${{ env.APK_PATH }}" -o apktool-output -f || true
           wget -q https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip -O jadx.zip
           unzip -q jadx.zip -d jadx && chmod +x jadx/bin/jadx
           ./jadx/bin/jadx -d jadx-output --show-bad-code "${{ env.APK_PATH }}"
 
-      - name: 🧠 Deep Parameter Analysis
+      - name: Deep Parameter Analysis
         run: |
           set -x
           cat > deep_analyzer.py << 'PYEOF'
-          import os, re, json, glob
-          traffic = json.load(open('traffic.json')) if os.path.exists('traffic.json') else []
-          code_files = glob.glob("jadx-output/**/*.java", recursive=True) + glob.glob("apktool-output/smali*/**/*.smali", recursive=True)
-          patterns = {
-              'timestamp': [(r'System\.currentTimeMillis\(\)', 'System.currentTimeMillis()'), (r'new Date\(\)', 'new Date()')],
-              'uuid': [(r'UUID\.randomUUID\(\)', 'UUID.randomUUID()')],
-              'nonce': [(r'SecureRandom', 'SecureRandom'), (r'Random\.nextBytes', 'Random bytes')],
-              'hash': [(r'MessageDigest\.getInstance\(["\']([^"\']+)["\']\)', 'MessageDigest({0})')],
-              'hmac': [(r'Mac\.getInstance\(["\']([^"\']+)["\']\)', 'Mac({0})'), (r'HmacSHA', 'HmacSHA*')],
-              'signature': [(r'Signature\.getInstance', 'Signature')],
-              'encryption': [(r'Cipher\.getInstance\(["\']([^"\']+)["\']\)', 'Cipher({0})'), (r'SecretKeySpec', 'SecretKeySpec')],
-              'encoding': [(r'Base64\.(encode|decode|encodeToString)', 'Base64'), (r'URLEncoder\.encode', 'URLEncoder')],
-              'device_id': [(r'Settings\.Secure\.ANDROID_ID', 'Android ID'), (r'Build\.SERIAL', 'Build.SERIAL')],
-              'network': [(r'OkHttpClient\.Builder', 'OkHttp'), (r'Retrofit\.Builder', 'Retrofit'), (r'addInterceptor', 'Interceptor'), (r'@Headers?\(', 'Headers')]
-          }
-          findings = {c: [] for c in patterns}
-          for fp in code_files:
-              try:
-                  with open(fp, 'r', encoding='utf-8', errors='ignore') as f: content = f.read()
-                  for cat, pats in patterns.items():
-                      for pat, desc in pats:
-                          for m in re.finditer(pat, content, re.I):
-                              ctx = content[max(0,m.start()-500):min(len(content),m.end()+500)].strip()
-                              algo = m.group(1) if m.groups() else ""
-                              findings[cat].append({'file':fp,'algorithm':algo,'description':desc.format(algo) if '{0}' in desc else desc,'context':ctx})
-              except: pass
-          summary = {c: len(i) for c,i in findings.items()}
-          json.dump({'findings':findings,'summary':summary,'traffic':traffic}, open('findings.json','w'), indent=2)
-          print(f"✅ {sum(summary.values())} findings")
-          PYEOF
+import os, re, json, glob
+traffic = json.load(open('traffic.json')) if os.path.exists('traffic.json') else []
+code_files = glob.glob("jadx-output/**/*.java", recursive=True) + glob.glob("apktool-output/smali*/**/*.smali", recursive=True)
+patterns = {
+    'timestamp': [(r'System\.currentTimeMillis\(\)', 'System.currentTimeMillis()'), (r'new Date\(\)', 'new Date()')],
+    'uuid': [(r'UUID\.randomUUID\(\)', 'UUID.randomUUID()')],
+    'nonce': [(r'SecureRandom', 'SecureRandom'), (r'Random\.nextBytes', 'Random bytes')],
+    'hash': [(r'MessageDigest\.getInstance\(["\']([^"\']+)["\']\)', 'MessageDigest({0})')],
+    'hmac': [(r'Mac\.getInstance\(["\']([^"\']+)["\']\)', 'Mac({0})'), (r'HmacSHA', 'HmacSHA*')],
+    'signature': [(r'Signature\.getInstance', 'Signature')],
+    'encryption': [(r'Cipher\.getInstance\(["\']([^"\']+)["\']\)', 'Cipher({0})'), (r'SecretKeySpec', 'SecretKeySpec')],
+    'encoding': [(r'Base64\.(encode|decode|encodeToString)', 'Base64'), (r'URLEncoder\.encode', 'URLEncoder')],
+    'device_id': [(r'Settings\.Secure\.ANDROID_ID', 'Android ID'), (r'Build\.SERIAL', 'Build.SERIAL')],
+    'network': [(r'OkHttpClient\.Builder', 'OkHttp'), (r'Retrofit\.Builder', 'Retrofit'), (r'addInterceptor', 'Interceptor'), (r'@Headers?\(', 'Headers')]
+}
+findings = {c: [] for c in patterns}
+for fp in code_files:
+    try:
+        with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        for cat, pats in patterns.items():
+            for pat, desc in pats:
+                for m in re.finditer(pat, content, re.I):
+                    ctx = content[max(0,m.start()-500):min(len(content),m.end()+500)].strip()
+                    algo = m.group(1) if m.groups() else ""
+                    findings[cat].append({'file':fp,'algorithm':algo,'description':desc.format(algo) if '{0}' in desc else desc,'context':ctx})
+    except:
+        pass
+summary = {c: len(i) for c,i in findings.items()}
+json.dump({'findings':findings,'summary':summary,'traffic':traffic}, open('findings.json','w'), indent=2)
+print(f"Found {sum(summary.values())} findings")
+PYEOF
           python3 deep_analyzer.py
 
-      # ============================================================
-      # 🎯 NEU: LOGIC VALIDATION & CONFIRMATION
-      # ============================================================
-      - name: 🎯 Validate Generation Logic (1:1 Replication)
+      - name: Validate Generation Logic (1:1 Replication)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           set -x
           cat > validate_logic.py << 'PYEOF'
-          import os, re, json, time, hashlib, hmac, uuid, secrets, base64
-          from datetime import datetime
+import os, re, json, time, hashlib, hmac, uuid, secrets, base64
+from datetime import datetime
 
-          print("=" * 70)
-          print("🎯 LOGIC VALIDATION - 1:1 REPLICATION TEST")
-          print("=" * 70)
+print("LOGIC VALIDATION - 1:1 REPLICATION TEST")
 
-          findings = json.load(open('findings.json')) if os.path.exists('findings.json') else {'findings':{},'summary':{},'traffic':[]}
-          traffic = findings.get('traffic', [])
+findings = json.load(open('findings.json')) if os.path.exists('findings.json') else {'findings':{},'summary':{},'traffic':[]}
+traffic = findings.get('traffic', [])
 
-          # Login-Request finden
-          login_req = None
-          for f in traffic:
-              url = f.get('url','').lower()
-              if any(k in url for k in ['login','auth','token','signin']):
-                  login_req = f; break
+login_req = None
+for f in traffic:
+    url = f.get('url','').lower()
+    if any(k in url for k in ['login','auth','token','signin']):
+        login_req = f
+        break
 
-          if not login_req:
-              print("⚠️ Kein Login-Request im Traffic")
-              login_req = {'method':'POST','url':'https://api.example.com/login','headers':{},'body':'{}'}
+if not login_req:
+    login_req = {'method':'POST','url':'https://api.example.com/login','headers':{},'body':'{}'}
 
-          # Echte dynamische Werte aus Traffic extrahieren
-          def detect_type(v):
-              if not isinstance(v, str): return None
-              if re.match(r'^\d{10,13}$', v): return 'timestamp'
-              if re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', v, re.I): return 'uuid'
-              if re.match(r'^[a-f0-9]{64}$', v, re.I): return 'sha256'
-              if re.match(r'^[a-f0-9]{40}$', v, re.I): return 'sha1'
-              if re.match(r'^[a-f0-9]{32}$', v, re.I): return 'md5'
-              if re.match(r'^[A-Za-z0-9+/]{20,}={0,2}$', v): return 'base64'
-              if re.match(r'^[a-zA-Z0-9_-]{16,64}$', v): return 'nonce'
-              return None
+def detect_type(v):
+    if not isinstance(v, str):
+        return None
+    if re.match(r'^\d{10,13}$', v):
+        return 'timestamp'
+    if re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', v, re.I):
+        return 'uuid'
+    if re.match(r'^[a-f0-9]{64}$', v, re.I):
+        return 'sha256'
+    if re.match(r'^[a-f0-9]{40}$', v, re.I):
+        return 'sha1'
+    if re.match(r'^[a-f0-9]{32}$', v, re.I):
+        return 'md5'
+    if re.match(r'^[A-Za-z0-9+/]{20,}={0,2}$', v):
+        return 'base64'
+    if re.match(r'^[a-zA-Z0-9_-]{16,64}$', v):
+        return 'nonce'
+    return None
 
-          real_dynamic = {}
-          # Headers scannen
-          for k, v in login_req.get('headers', {}).items():
-              t = detect_type(v)
-              if t: real_dynamic[f"header:{k}"] = {'type':t, 'value':v}
-          # Body scannen
-          try:
-              body = json.loads(login_req.get('body','{}'))
-              def scan_body(obj, path=""):
-                  if isinstance(obj, dict):
-                      for k,v in obj.items():
-                          scan_body(v, f"{path}.{k}" if path else k)
-                  elif isinstance(obj, str):
-                      t = detect_type(obj)
-                      if t: real_dynamic[f"body:{path}"] = {'type':t, 'value':obj}
-              scan_body(body)
-          except: pass
+real_dynamic = {}
+for k, v in login_req.get('headers', {}).items():
+    t = detect_type(v)
+    if t:
+        real_dynamic[f"header:{k}"] = {'type':t, 'value':v}
 
-          print(f"\n📊 Echte dynamische Werte im Traffic: {len(real_dynamic)}")
-          for k, v in real_dynamic.items():
-              print(f"  {k}: {v['type']} = {v['value'][:40]}...")
+try:
+    body = json.loads(login_req.get('body','{}'))
+    def scan_body(obj, path=""):
+        if isinstance(obj, dict):
+            for k,v in obj.items():
+                scan_body(v, f"{path}.{k}" if path else k)
+        elif isinstance(obj, str):
+            t = detect_type(obj)
+            if t:
+                real_dynamic[f"body:{path}"] = {'type':t, 'value':obj}
+    scan_body(body)
+except:
+    pass
 
-          # ============================================================
-          # 1:1 Replikation basierend auf Code-Analyse
-          # ============================================================
-          print("\n🔬 Repliziere Logik 1:1 aus Code...")
-          
-          replicated = {}
-          test_timestamp = int(time.time() * 1000)
-          
-          # Timestamp replizieren
-          if findings['summary'].get('timestamp', 0) > 0:
-              replicated['timestamp'] = {'value': test_timestamp, 'logic': 'int(time.time() * 1000)'}
+print(f"Found {len(real_dynamic)} dynamic values in traffic")
 
-          # UUID replizieren
-          if findings['summary'].get('uuid', 0) > 0:
-              replicated['uuid'] = {'value': str(uuid.uuid4()), 'logic': 'str(uuid.uuid4())'}
+replicated = {}
+test_timestamp = int(time.time() * 1000)
 
-          # Nonce replizieren
-          if findings['summary'].get('nonce', 0) > 0:
-              replicated['nonce'] = {'value': secrets.token_urlsafe(16), 'logic': 'secrets.token_urlsafe(16)'}
+if findings['summary'].get('timestamp', 0) > 0:
+    replicated['timestamp'] = {'value': test_timestamp, 'logic': 'int(time.time() * 1000)'}
+if findings['summary'].get('uuid', 0) > 0:
+    replicated['uuid'] = {'value': str(uuid.uuid4()), 'logic': 'str(uuid.uuid4())'}
+if findings['summary'].get('nonce', 0) > 0:
+    replicated['nonce'] = {'value': secrets.token_urlsafe(16), 'logic': 'secrets.token_urlsafe(16)'}
 
-          # Secret Key aus Code extrahieren
-          secret_key = None
-          for item in findings['findings'].get('encryption', []) + findings['findings'].get('hmac', []):
-              ctx = item.get('context', '')
-              # Suche nach hardcoded Strings
-              matches = re.findall(r'["\']([a-zA-Z0-9_\-]{16,64})["\']', ctx)
-              for m in matches:
-                  if not m.startswith('http') and 'password' not in m.lower():
-                      secret_key = m
-                      print(f"🔑 Secret Key gefunden: {m[:20]}...")
-                      break
-              if secret_key: break
+secret_key = None
+for item in findings['findings'].get('encryption', []) + findings['findings'].get('hmac', []):
+    ctx = item.get('context', '')
+    matches = re.findall(r'["\']([a-zA-Z0-9_\-]{16,64})["\']', ctx)
+    for m in matches:
+        if not m.startswith('http') and 'password' not in m.lower():
+            secret_key = m
+            print(f"Found Secret Key: {m[:20]}...")
+            break
+    if secret_key:
+        break
 
-          # HMAC replizieren
-          if findings['summary'].get('hmac', 0) > 0:
-              # Versuche die Message-Reihenfolge aus dem Code zu verstehen
-              message_parts = []
-              for item in findings['findings'].get('hmac', []):
-                  ctx = item.get('context', '')
-                  # Suche nach String-Verkettungen
-                  concat_matches = re.findall(r'["\']([^"\']+)["\']\s*\+\s*(\w+)', ctx)
-                  for prefix, var in concat_matches:
-                      message_parts.append(prefix)
-              
-              # Standard-Message bauen
-              if secret_key:
-                  message = f"email={os.environ.get('TEST_EMAIL','test@test.com')}&timestamp={test_timestamp}"
-                  sig = hmac.new(secret_key.encode(), message.encode(), hashlib.sha256).hexdigest()
-                  replicated['hmac_sha256'] = {'value': sig, 'logic': f'hmac.new(b"{secret_key}", b"{message}", sha256).hexdigest()'}
+if findings['summary'].get('hmac', 0) > 0 and secret_key:
+    message = f"email=test@test.com&timestamp={test_timestamp}"
+    sig = hmac.new(secret_key.encode(), message.encode(), hashlib.sha256).hexdigest()
+    replicated['hmac_sha256'] = {'value': sig, 'logic': f'hmac.new(b"{secret_key}", b"{message}", sha256).hexdigest()'}
 
-          # Hash replizieren
-          if findings['summary'].get('hash', 0) > 0:
-              data = f"{test_timestamp}{os.environ.get('TEST_EMAIL','test')}"
-              replicated['sha256'] = {'value': hashlib.sha256(data.encode()).hexdigest(), 'logic': f'hashlib.sha256(b"{data}").hexdigest()'}
+if findings['summary'].get('hash', 0) > 0:
+    data = f"{test_timestamp}test"
+    replicated['sha256'] = {'value': hashlib.sha256(data.encode()).hexdigest(), 'logic': f'hashlib.sha256(b"{data}").hexdigest()'}
 
-          # ============================================================
-          # Validierung: Vergleich mit echtem Traffic
-          # ============================================================
-          print("\n🔍 Validiere gegen Traffic...")
-          validation_results = []
-          all_passed = True
+print("Validating against traffic...")
+validation_results = []
+all_passed = True
 
-          for key, real in real_dynamic.items():
-              rt = real['type']
-              rv = real['value']
-              
-              # Finde replizierten Wert gleichen Typs
-              match_found = False
-              for rk, rep in replicated.items():
-                  if rt in rk or rt in rep.get('logic',''):
-                      # Bei Timestamp: nur Format prüfen (Wert ändert sich)
-                      if rt == 'timestamp':
-                          if re.match(r'^\d{10,13}$', str(rep['value'])):
-                              validation_results.append({
-                                  'traffic_key': key, 'traffic_value': rv,
-                                  'replicated_value': rep['value'], 'logic': rep['logic'],
-                                  'status': 'FORMAT_MATCH', 'note': 'Timestamp format correct'
-                              })
-                              match_found = True
-                              break
-                      # Bei UUID: nur Format prüfen
-                      elif rt == 'uuid':
-                          if re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', str(rep['value']), re.I):
-                              validation_results.append({
-                                  'traffic_key': key, 'traffic_value': rv,
-                                  'replicated_value': rep['value'], 'logic': rep['logic'],
-                                  'status': 'FORMAT_MATCH', 'note': 'UUID format correct'
-                              })
-                              match_found = True
-                              break
-                      # Bei Nonce: nur Format prüfen
-                      elif rt == 'nonce':
-                          if re.match(r'^[a-zA-Z0-9_\-]{16,}$', str(rep['value'])):
-                              validation_results.append({
-                                  'traffic_key': key, 'traffic_value': rv,
-                                  'replicated_value': rep['value'], 'logic': rep['logic'],
-                                  'status': 'FORMAT_MATCH', 'note': 'Nonce format correct'
-                              })
-                              match_found = True
-                              break
-                      # Bei Hash/HMAC: exakter Wert-Vergleich möglich wenn Inputs gleich
-                      elif rt in ['sha256', 'sha1', 'md5']:
-                          if rep['value'] == rv:
-                              validation_results.append({
-                                  'traffic_key': key, 'traffic_value': rv,
-                                  'replicated_value': rep['value'], 'logic': rep['logic'],
-                                  'status': 'EXACT_MATCH', 'note': '✅ Hash matches exactly!'
-                              })
-                              match_found = True
-                              break
-                          else:
-                              validation_results.append({
-                                  'traffic_key': key, 'traffic_value': rv,
-                                  'replicated_value': rep['value'], 'logic': rep['logic'],
-                                  'status': 'MISMATCH', 'note': 'Hash differs - inputs or algorithm wrong'
-                              })
-                              match_found = True
-                              all_passed = False
-                              break
-              
-              if not match_found:
-                  validation_results.append({
-                      'traffic_key': key, 'traffic_value': rv,
-                      'replicated_value': 'NOT_REPLICATED', 'logic': 'MISSING',
-                      'status': 'NO_REPLICATION', 'note': f'No replication logic for type {rt}'
-                  })
-                  all_passed = False
+for key, real in real_dynamic.items():
+    rt = real['type']
+    rv = real['value']
+    match_found = False
+    
+    for rk, rep in replicated.items():
+        if rt in rk or rt in rep.get('logic',''):
+            if rt == 'timestamp' and re.match(r'^\d{10,13}$', str(rep['value'])):
+                validation_results.append({'traffic_key': key, 'traffic_value': rv, 'replicated_value': rep['value'], 'logic': rep['logic'], 'status': 'FORMAT_MATCH', 'note': 'Timestamp format correct'})
+                match_found = True
+                break
+            elif rt == 'uuid' and re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', str(rep['value']), re.I):
+                validation_results.append({'traffic_key': key, 'traffic_value': rv, 'replicated_value': rep['value'], 'logic': rep['logic'], 'status': 'FORMAT_MATCH', 'note': 'UUID format correct'})
+                match_found = True
+                break
+            elif rt == 'nonce' and re.match(r'^[a-zA-Z0-9_\-]{16,}$', str(rep['value'])):
+                validation_results.append({'traffic_key': key, 'traffic_value': rv, 'replicated_value': rep['value'], 'logic': rep['logic'], 'status': 'FORMAT_MATCH', 'note': 'Nonce format correct'})
+                match_found = True
+                break
+            elif rt in ['sha256', 'sha1', 'md5']:
+                if rep['value'] == rv:
+                    validation_results.append({'traffic_key': key, 'traffic_value': rv, 'replicated_value': rep['value'], 'logic': rep['logic'], 'status': 'EXACT_MATCH', 'note': 'Hash matches exactly!'})
+                    match_found = True
+                    break
+                else:
+                    validation_results.append({'traffic_key': key, 'traffic_value': rv, 'replicated_value': rep['value'], 'logic': rep['logic'], 'status': 'MISMATCH', 'note': 'Hash differs'})
+                    match_found = True
+                    all_passed = False
+                    break
+    
+    if not match_found:
+        validation_results.append({'traffic_key': key, 'traffic_value': rv, 'replicated_value': 'NOT_REPLICATED', 'logic': 'MISSING', 'status': 'NO_REPLICATION', 'note': f'No replication logic for type {rt}'})
+        all_passed = False
 
-          # Ergebnis speichern
-          result = {
-              'timestamp': datetime.now().isoformat(),
-              'real_dynamic_values': real_dynamic,
-              'replicated_values': replicated,
-              'validation': validation_results,
-              'all_passed': all_passed,
-              'login_request': login_req
-          }
-          json.dump(result, open('validation_result.json','w'), indent=2)
+result = {
+    'timestamp': datetime.now().isoformat(),
+    'real_dynamic_values': real_dynamic,
+    'replicated_values': replicated,
+    'validation': validation_results,
+    'all_passed': all_passed,
+    'login_request': login_req
+}
+json.dump(result, open('validation_result.json','w'), indent=2)
 
-          print(f"\n{'='*70}")
-          print(f"📊 VALIDATION SUMMARY")
-          print(f"{'='*70}")
-          for v in validation_results:
-              status_icon = '✅' if 'MATCH' in v['status'] else '❌'
-              print(f"{status_icon} {v['traffic_key']}: {v['status']}")
-              print(f"   Traffic:    {v['traffic_value'][:50]}")
-              print(f"   Replicated: {str(v['replicated_value'])[:50]}")
-              print(f"   Note: {v['note']}")
-              print()
-
-          if all_passed:
-              print("🎉 ALLE VALIDIERUNGEN BESTANDEN!")
-              print("✅ Logic is confirmed - creating CONFIRMED_LOGIC.txt")
-          else:
-              print("⚠️  SOME VALIDATIONS FAILED - needs deep re-analysis")
-              print("🔄 Triggering Gemini Deep Analysis...")
-
-          # Exit-Code setzen für nächsten Step
-          with open('validation_status.txt', 'w') as f:
-              f.write('PASSED' if all_passed else 'FAILED')
-          PYEOF
+print(f"Validation Summary: {'PASSED' if all_passed else 'FAILED'}")
+with open('validation_status.txt', 'w') as f:
+    f.write('PASSED' if all_passed else 'FAILED')
+PYEOF
           python3 validate_logic.py
 
-      # ============================================================
-      # 🔄 DEEP RE-ANALYSIS bei Fehlschlag (mit Gemini)
-      # ============================================================
-      - name: 🔄 Deep Re-Analysis (Gemini Code Intelligence)
+      - name: Deep Re-Analysis (Gemini Code Intelligence)
         if: always()
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -545,70 +489,76 @@ jobs:
           echo "Validation status: $STATUS"
           
           if [ "$STATUS" = "PASSED" ]; then
-            echo "✅ Validation passed - skipping deep re-analysis"
+            echo "Validation passed - skipping deep re-analysis"
             exit 0
           fi
 
-          echo "🔄 Starting Gemini Deep Re-Analysis..."
+          echo "Starting Gemini Deep Re-Analysis..."
           cat > deep_reanalysis.py << 'PYEOF'
-          import os, json, re, glob
-          import google.generativeai as genai
+import os, json, re, glob
+import google.generativeai as genai
 
-          genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-          model = genai.GenerativeModel("gemini-2.0-flash")
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+model = genai.GenerativeModel("gemini-2.0-flash")
 
-          validation = json.load(open('validation_result.json'))
-          findings = json.load(open('findings.json'))
+validation = json.load(open('validation_result.json'))
+findings = json.load(open('findings.json'))
 
-          failed = [v for v in validation['validation'] if 'MATCH' not in v['status']]
-          if not failed:
-              print("✅ Nothing to re-analyze")
-              exit(0)
+failed = [v for v in validation['validation'] if 'MATCH' not in v['status']]
+if not failed:
+    print("Alles bestanden, keine Re-Analyse noetig.")
+    exit(0)
 
-          print(f"🔍 Re-analyzing {len(failed)} failed validations...")
+print(f"Re-analyzing {len(failed)} failed validations...")
 
-          # Für jeden fehlgeschlagenen Wert: konkreten Code finden und Gemini fragen
-          reanalysis_results = []
-          
-          for fail in failed:
-              key = fail['traffic_key']
-              real_value = fail['traffic_value']
-              traffic_type = None
-              for rd_key, rd in validation['real_dynamic_values'].items():
-                  if rd_key == key:
-                      traffic_type = rd['type']; break
-              
-              print(f"\n🎯 Re-analyzing: {key} (type: {traffic_type})")
-              print(f"   Real value: {real_value[:60]}...")
+reanalysis_results = []
 
-              # Finde relevante Code-Snippets
-              relevant_code = []
-              for cat, items in findings['findings'].items():
-                  if traffic_type in cat or (traffic_type == 'sha256' and cat == 'hash') or (traffic_type == 'nonce' and cat == 'nonce'):
-                      for item in items[:5]:
-                          relevant_code.append(f"--- {item['file']} ---\n{item['context']}")
-
-              if not relevant_code:
-                  # Fallback: Suche direkt in Code nach dem Wert-Muster
-                  for fp in glob.glob("jadx-output/**/*.java", recursive=True)[:50]:
-                      try:
-                          with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
-                              content = f.read()
-                              if traffic_type == 'sha256' and 'MessageDigest' in content and 'SHA' in content:
-                                  relevant_code.append(f"--- {fp} ---\n{content[:2000]}")
-                              elif traffic_type == 'nonce' and 'SecureRandom' in content:
-                                  relevant_code.append(f"--- {fp} ---\n{content[:2000]}")
-                      except: pass
-
-              if not relevant_code:
-                  reanalysis_results.append({
-                      'key': key, 'type': traffic_type,
-                      'status': 'NO_CODE_FOUND', 'analysis': 'Could not find relevant code'
-                  })
-                  continue
-
-              # Gemini fragen
-              prompt = f"""Du bist ein Android Reverse Engineering Experte.
+for fail in failed:
+    key = fail['traffic_key']
+    real_value = fail['traffic_value']
+    traffic_type = None
+    for rd_key, rd in validation['real_dynamic_values'].items():
+        if rd_key == key:
+            traffic_type = rd['type']
+            break
+    
+    print(f"\nRe-analyzing: {key} (type: {traffic_type})")
+    
+    relevant_code = []
+    for cat, items in findings['findings'].items():
+        if traffic_type in cat or (traffic_type == 'sha256' and cat == 'hash') or (traffic_type == 'nonce' and cat == 'nonce'):
+            for item in items[:5]:
+                relevant_code.append(f"--- {item['file']} ---\n{item['context']}")
+    
+    if not relevant_code:
+        for fp in glob.glob("jadx-output/**/*.java", recursive=True)[:50]:
+            try:
+                with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                    if traffic_type == 'sha256' and 'MessageDigest' in content:
+                        relevant_code.append(f"--- {fp} ---\n{content[:2000]}")
+                    elif traffic_type == 'nonce' and 'SecureRandom' in content:
+                        relevant_code.append(f"--- {fp} ---\n{content[:2000]}")
+            except:
+                pass
+    
+    if not relevant_code:
+        reanalysis_results.append({'key': key, 'type': traffic_type, 'status': 'NO_CODE_FOUND'})
+        continue
+    
+    # YAML-SAFE STRING CONSTRUCTION (vermeidet {{ }} Parsing-Fehler in GitHub Actions)
+    json_template = '{' + """
+  "algorithm": "z.B. HmacSHA256",
+  "secret_key": "der hardcoded key oder null",
+  "message_construction": "Beschreibung wie die Message gebaut wird",
+  "encoding": "hex/base64/raw",
+  "python_code": "vollstaendiger Python-Code der den Wert generiert",
+  "test_output": "Beispielausgabe des Python-Codes",
+  "confidence": "high/medium/low",
+  "explanation": "Kurze Erklaerung der Logik"
+""" + '}'
+    
+    prompt = f"""Du bist ein Android Reverse Engineering Experte.
 
 Ich habe einen dynamischen Parameter aus dem Netzwerk-Traffic einer App:
 - Key: {key}
@@ -623,223 +573,197 @@ AUFGABE:
 1. Analysiere EXAKT wie dieser Parameter generiert wird
 2. Identifiziere:
    - Den Secret Key (falls vorhanden, hardcoded)
-   - Die Message-Reihenfolge (welche Parameter werden verkettet in welcher Reihenfolge?)
+   - Die Message-Reihenfolge
    - Den Algorithmus (SHA256, HmacSHA256, etc.)
    - Das Encoding (Hex, Base64, etc.)
-3. Gib Python-Code zurück, der den Wert 1:1 repliziert
+3. Gib Python-Code zurueck, der den Wert 1:1 repliziert
 
-ANTWORTFORMAT (nur JSON):
-{{
-  "algorithm": "z.B. HmacSHA256",
-  "secret_key": "der hardcoded key oder null",
-  "message_construction": "Beschreibung wie die Message gebaut wird",
-  "encoding": "hex/base64/raw",
-  "python_code": "vollständiger Python-Code der den Wert generiert",
-  "test_output": "Beispielausgabe des Python-Codes",
-  "confidence": "high/medium/low",
-  "explanation": "Kurze Erklärung der Logik"
-}}"""
+ANTWORTFORMAT (nur JSON, keine Markdown-Formatierung):
+{json_template}
+"""
+    
+    try:
+        response = model.generate_content(
+            [prompt],
+            generation_config=genai.GenerationConfig(response_mime_type="application/json")
+        )
+        analysis = json.loads(response.text)
+        
+        test_result = "NOT_TESTED"
+        if 'python_code' in analysis:
+            try:
+                exec_globals = {}
+                exec(analysis['python_code'], exec_globals)
+                if 'generate' in exec_globals:
+                    test_result = str(exec_globals['generate']())
+                elif 'result' in exec_globals:
+                    test_result = str(exec_globals['result'])
+            except Exception as e:
+                test_result = f"EXEC_ERROR: {e}"
+        
+        analysis['test_output_actual'] = test_result
+        analysis['status'] = 'ANALYZED'
+        reanalysis_results.append({'key': key, 'type': traffic_type, 'analysis': analysis})
+        print(f"Analyzed: {analysis.get('algorithm','?')}")
+    except Exception as e:
+        reanalysis_results.append({'key': key, 'type': traffic_type, 'status': 'GEMINI_ERROR', 'analysis': str(e)})
 
-              try:
-                  response = model.generate_content(
-                      [prompt],
-                      generation_config=genai.GenerationConfig(response_mime_type="application/json")
-                  )
-                  analysis = json.loads(response.text)
-                  
-                  # Python-Code ausführen und testen
-                  test_result = "NOT_TESTED"
-                  if 'python_code' in analysis:
-                      try:
-                          exec_globals = {}
-                          exec(analysis['python_code'], exec_globals)
-                          if 'generate' in exec_globals:
-                              test_result = str(exec_globals['generate']())
-                          elif 'result' in exec_globals:
-                              test_result = str(exec_globals['result'])
-                      except Exception as e:
-                          test_result = f"EXEC_ERROR: {e}"
-                  
-                  analysis['test_output_actual'] = test_result
-                  analysis['status'] = 'ANALYZED'
-                  reanalysis_results.append({
-                      'key': key, 'type': traffic_type,
-                      'analysis': analysis
-                  })
-                  print(f"✅ Analyzed: {analysis.get('algorithm','?')} with confidence {analysis.get('confidence','?')}")
-              except Exception as e:
-                  reanalysis_results.append({
-                      'key': key, 'type': traffic_type,
-                      'status': 'GEMINI_ERROR', 'analysis': str(e)
-                  })
-
-          json.dump(reanalysis_results, open('deep_reanalysis.json','w'), indent=2)
-          print(f"\n✅ Deep re-analysis complete: {len(reanalysis_results)} items")
-          PYEOF
+json.dump(reanalysis_results, open('deep_reanalysis.json','w'), indent=2)
+print(f"Deep re-analysis complete: {len(reanalysis_results)} items")
+PYEOF
           python3 deep_reanalysis.py
 
-      # ============================================================
-      # 📝 REPORTS GENERIEREN
-      # ============================================================
-      - name: 📝 Generate CONFIRMED_LOGIC.txt
+      - name: Generate CONFIRMED_LOGIC.txt
         if: always()
         run: |
           set -x
           cat > generate_final_report.py << 'PYEOF'
-          import os, json, time, hashlib, hmac, uuid, secrets, base64
-          from datetime import datetime
+import os, json
+from datetime import datetime
 
-          validation = json.load(open('validation_result.json')) if os.path.exists('validation_result.json') else {}
-          reanalysis = json.load(open('deep_reanalysis.json')) if os.path.exists('deep_reanalysis.json') else []
-          findings = json.load(open('findings.json')) if os.path.exists('findings.json') else {'findings':{},'summary':{},'traffic':[]}
+validation = json.load(open('validation_result.json')) if os.path.exists('validation_result.json') else {}
+reanalysis = json.load(open('deep_reanalysis.json')) if os.path.exists('deep_reanalysis.json') else []
+findings = json.load(open('findings.json')) if os.path.exists('findings.json') else {'findings':{},'summary':{},'traffic':[]}
 
-          report = []
-          report.append("=" * 80)
-          report.append("🔐 CONFIRMED GENERATION LOGIC - FINAL REPORT")
-          report.append("=" * 80)
-          report.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-          report.append("")
+report = []
+report.append("=" * 80)
+report.append("CONFIRMED GENERATION LOGIC - FINAL REPORT")
+report.append("=" * 80)
+report.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+report.append("")
 
-          # STATUS
-          status = "PASSED" if validation.get('all_passed', False) else "PARTIAL (with deep re-analysis)"
-          report.append(f"📊 VALIDATION STATUS: {status}")
-          report.append("")
+status = "PASSED" if validation.get('all_passed', False) else "PARTIAL (with deep re-analysis)"
+report.append(f"VALIDATION STATUS: {status}")
+report.append("")
 
-          # SECTION 1: Bestätigte Logik
-          report.append("=" * 80)
-          report.append("SECTION 1: ✅ CONFIRMED GENERATION LOGIC")
-          report.append("=" * 80)
-          report.append("")
+report.append("=" * 80)
+report.append("SECTION 1: CONFIRMED GENERATION LOGIC")
+report.append("=" * 80)
+report.append("")
 
-          confirmed = [v for v in validation.get('validation', []) if 'MATCH' in v.get('status','')]
-          if confirmed:
-              for v in confirmed:
-                  report.append(f"🎯 {v['traffic_key']}")
-                  report.append(f"   Status: {v['status']}")
-                  report.append(f"   Traffic Value: {v['traffic_value']}")
-                  report.append(f"   Replicated:    {v['replicated_value']}")
-                  report.append(f"   Logic: {v['logic']}")
-                  report.append(f"   Note: {v['note']}")
-                  report.append("")
-          else:
-              report.append("Keine direkte Bestätigung aus erster Analyse.")
-              report.append("")
+confirmed = [v for v in validation.get('validation', []) if 'MATCH' in v.get('status','')]
+if confirmed:
+    for v in confirmed:
+        report.append(f"Parameter: {v['traffic_key']}")
+        report.append(f"  Status: {v['status']}")
+        report.append(f"  Traffic Value: {v['traffic_value']}")
+        report.append(f"  Replicated:    {v['replicated_value']}")
+        report.append(f"  Logic: {v['logic']}")
+        report.append(f"  Note: {v['note']}")
+        report.append("")
+else:
+    report.append("Keine direkte Bestaetigung aus erster Analyse.")
+    report.append("")
 
-          # SECTION 2: Deep Re-Analysis Ergebnisse
-          report.append("\n" + "=" * 80)
-          report.append("SECTION 2: 🔬 DEEP RE-ANALYSIS (Gemini Code Intelligence)")
-          report.append("=" * 80)
-          report.append("")
+report.append("=" * 80)
+report.append("SECTION 2: DEEP RE-ANALYSIS (Gemini Code Intelligence)")
+report.append("=" * 80)
+report.append("")
 
-          if reanalysis:
-              for item in reanalysis:
-                  report.append(f"\n🎯 Parameter: {item['key']}")
-                  report.append(f"   Type: {item.get('type','?')}")
-                  report.append(f"   Status: {item.get('status','?')}")
-                  
-                  if 'analysis' in item and isinstance(item['analysis'], dict):
-                      a = item['analysis']
-                      report.append(f"\n   📋 ANALYSIS:")
-                      report.append(f"   Algorithm: {a.get('algorithm','?')}")
-                      report.append(f"   Secret Key: {a.get('secret_key','null')}")
-                      report.append(f"   Message Construction: {a.get('message_construction','?')}")
-                      report.append(f"   Encoding: {a.get('encoding','?')}")
-                      report.append(f"   Confidence: {a.get('confidence','?')}")
-                      report.append(f"   Explanation: {a.get('explanation','?')}")
-                      
-                      if 'python_code' in a:
-                          report.append(f"\n   💻 PYTHON REPLICATION CODE:")
-                          report.append("   " + "-" * 60)
-                          for line in a['python_code'].split('\n'):
-                              report.append(f"   {line}")
-                          report.append("   " + "-" * 60)
-                      
-                      report.append(f"\n   🧪 TEST OUTPUT: {a.get('test_output_actual','?')}")
-                  report.append("")
-          else:
-              report.append("Keine Deep Re-Analysis durchgeführt.")
-              report.append("")
+if reanalysis:
+    for item in reanalysis:
+        report.append(f"Parameter: {item['key']}")
+        report.append(f"  Type: {item.get('type','?')}")
+        report.append(f"  Status: {item.get('status','?')}")
+        
+        if 'analysis' in item and isinstance(item['analysis'], dict):
+            a = item['analysis']
+            report.append(f"  Algorithm: {a.get('algorithm','?')}")
+            report.append(f"  Secret Key: {a.get('secret_key','null')}")
+            report.append(f"  Message Construction: {a.get('message_construction','?')}")
+            report.append(f"  Encoding: {a.get('encoding','?')}")
+            report.append(f"  Confidence: {a.get('confidence','?')}")
+            report.append(f"  Explanation: {a.get('explanation','?')}")
+            
+            if 'python_code' in a:
+                report.append("  PYTHON REPLICATION CODE:")
+                report.append("  " + "-" * 60)
+                for line in a['python_code'].split('\n'):
+                    report.append(f"  {line}")
+                report.append("  " + "-" * 60)
+            
+            report.append(f"  TEST OUTPUT: {a.get('test_output_actual','?')}")
+        report.append("")
+else:
+    report.append("Keine Deep Re-Analysis durchgefuehrt.")
+    report.append("")
 
-          # SECTION 3: Traffic Beispiele
-          report.append("\n" + "=" * 80)
-          report.append("SECTION 3: 📡 TRAFFIC EXAMPLES (Real Values)")
-          report.append("=" * 80)
-          report.append("")
+report.append("=" * 80)
+report.append("SECTION 3: TRAFFIC EXAMPLES (Real Values)")
+report.append("=" * 80)
+report.append("")
 
-          real_vals = validation.get('real_dynamic_values', {})
-          if real_vals:
-              for k, v in real_vals.items():
-                  report.append(f"  {k}")
-                  report.append(f"    Type:  {v['type']}")
-                  report.append(f"    Value: {v['value']}")
-                  report.append("")
-          else:
-              report.append("Keine dynamischen Werte im Traffic gefunden.")
-              report.append("")
+real_vals = validation.get('real_dynamic_values', {})
+if real_vals:
+    for k, v in real_vals.items():
+        report.append(f"  {k}")
+        report.append(f"    Type:  {v['type']}")
+        report.append(f"    Value: {v['value']}")
+        report.append("")
+else:
+    report.append("Keine dynamischen Werte im Traffic gefunden.")
+    report.append("")
 
-          # SECTION 4: Code Fundstellen
-          report.append("\n" + "=" * 80)
-          report.append("SECTION 4: 🔍 CODE FINDINGS (apktool + jadx)")
-          report.append("=" * 80)
-          report.append("")
+report.append("=" * 80)
+report.append("SECTION 4: CODE FINDINGS (apktool + jadx)")
+report.append("=" * 80)
+report.append("")
 
-          for cat, items in findings.get('findings', {}).items():
-              if items:
-                  report.append(f"\n[{cat.upper()}] - {len(items)} Fundstellen")
-                  report.append("-" * 60)
-                  for i, item in enumerate(items[:2], 1):
-                      report.append(f"  [{i}] {item['description']}")
-                      report.append(f"      File: {item['file']}")
-                      report.append("      Context:")
-                      for line in item['context'].split('\n')[:6]:
-                          report.append(f"        {line}")
-                      report.append("")
+for cat, items in findings.get('findings', {}).items():
+    if items:
+        report.append(f"[{cat.upper()}] - {len(items)} Fundstellen")
+        report.append("-" * 60)
+        for i, item in enumerate(items[:2], 1):
+            report.append(f"  [{i}] {item['description']}")
+            report.append(f"      File: {item['file']}")
+            report.append("      Context:")
+            for line in item['context'].split('\n')[:6]:
+                report.append(f"        {line}")
+            report.append("")
 
-          # SECTION 5: Vollständiger Login-Request
-          report.append("\n" + "=" * 80)
-          report.append("SECTION 5: 🚀 COMPLETE LOGIN REQUEST (Ready to Send)")
-          report.append("=" * 80)
-          report.append("")
+report.append("=" * 80)
+report.append("SECTION 5: COMPLETE LOGIN REQUEST (Ready to Send)")
+report.append("=" * 80)
+report.append("")
 
-          login_req = validation.get('login_request', {})
-          if login_req:
-              report.append(f"METHOD: {login_req.get('method','POST')}")
-              report.append(f"URL: {login_req.get('url','')}")
-              report.append("\nHEADERS:")
-              for k, v in login_req.get('headers', {}).items():
-                  report.append(f"  {k}: {v}")
-              report.append("\nBODY:")
-              report.append(login_req.get('body','{}'))
-          report.append("")
+login_req = validation.get('login_request', {})
+if login_req:
+    report.append(f"METHOD: {login_req.get('method','POST')}")
+    report.append(f"URL: {login_req.get('url','')}")
+    report.append("HEADERS:")
+    for k, v in login_req.get('headers', {}).items():
+        report.append(f"  {k}: {v}")
+    report.append("BODY:")
+    report.append(login_req.get('body','{}'))
+report.append("")
 
-          # SECTION 6: Zusammenfassung
-          report.append("\n" + "=" * 80)
-          report.append("SECTION 6: 📊 SUMMARY")
-          report.append("=" * 80)
-          report.append("")
-          report.append(f"Validation Status: {status}")
-          report.append(f"Confirmed Parameters: {len(confirmed)}")
-          report.append(f"Deep Re-Analysis Items: {len(reanalysis)}")
-          report.append(f"Total Dynamic Values in Traffic: {len(real_vals)}")
-          report.append("")
-          report.append("Code Analysis:")
-          for cat, count in findings.get('summary', {}).items():
-              if count > 0:
-                  report.append(f"  • {cat.upper():20} : {count} findings")
-          report.append("")
-          report.append("=" * 80)
+report.append("=" * 80)
+report.append("SECTION 6: SUMMARY")
+report.append("=" * 80)
+report.append("")
+report.append(f"Validation Status: {status}")
+report.append(f"Confirmed Parameters: {len(confirmed)}")
+report.append(f"Deep Re-Analysis Items: {len(reanalysis)}")
+report.append(f"Total Dynamic Values in Traffic: {len(real_vals)}")
+report.append("")
+report.append("Code Analysis:")
+for cat, count in findings.get('summary', {}).items():
+    if count > 0:
+        report.append(f"  - {cat.upper()}: {count} findings")
+report.append("")
+report.append("=" * 80)
 
-          with open('CONFIRMED_LOGIC.txt', 'w', encoding='utf-8') as f:
-              f.write('\n'.join(report))
+with open('CONFIRMED_LOGIC.txt', 'w', encoding='utf-8') as f:
+    f.write('\n'.join(report))
 
-          print(f"✅ CONFIRMED_LOGIC.txt erstellt ({len(report)} Zeilen)")
-          PYEOF
+print(f"CONFIRMED_LOGIC.txt erstellt ({len(report)} Zeilen)")
+PYEOF
           python3 generate_final_report.py
           
           echo "=== Report Preview ==="
           head -100 CONFIRMED_LOGIC.txt
 
-      - name: 💾 Save Artifacts
+      - name: Save Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -856,7 +780,7 @@ ANTWORTFORMAT (nur JSON):
           if-no-files-found: warn
           retention-days: 30
 
-      - name: 🧹 Cleanup
+      - name: Cleanup
         if: always()
         run: |
           set -x
