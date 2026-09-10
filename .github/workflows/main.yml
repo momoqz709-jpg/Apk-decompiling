@@ -1,0 +1,246 @@
+name: AI Vision APK Traffic Extraction with Crypto Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'App Package Name (e.g., com.example.app)'
+        required: true
+        type: string
+
+jobs:
+  ai-intercept:
+    runs-on: self-hosted
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ==========================================
+      # 1. APK FINDEN & EXTRAHIEREN
+      # ==========================================
+      - name: 1. Find and Extract APK (XAPK/APKM Ready)
+        run: |
+          FILE=$(find . -type f \( -name "*.apk" -o -name "*.xapk" -o -name "*.apkm" \) | head -n 1)
+          if [ -z "$FILE" ]; then 
+            echo "::error::❌ No APK, XAPK, or APKM file found in the repository."
+            exit 1 
+          fi
+          
+          echo "✅ Found package: $FILE"
+          
+          if [[ "$FILE" == *.xapk ]] || [[ "$FILE" == *.apkm ]]; then
+            echo "📦 Detected archive format. Extracting..."
+            mkdir -p pkg_extract
+            unzip -q "$FILE" -d pkg_extract
+            
+            APK_COUNT=$(find pkg_extract -name "*.apk" | wc -l)
+            
+            if [ "$APK_COUNT" -gt 1 ]; then
+              echo "📦 Found $APK_COUNT split APKs. Preparing for install-multiple..."
+              mkdir -p split_apks
+              find pkg_extract -name "*.apk" -exec cp {} split_apks/ \;
+              echo "SPLIT_INSTALL=true" >> $GITHUB_ENV
+              
+              BASE_APK=$(find split_apks -name "*.apk" -exec ls -s {} + | sort -n -r | head -1 | awk '{print $2}')
+              cp "$BASE_APK" target.apk
+            else
+              echo "📦 Found single APK inside archive."
+              cp $(find pkg_extract -name "*.apk" | head -n 1) target.apk
+              echo "SPLIT_INSTALL=false" >> $GITHUB_ENV
+            fi
+          else
+            cp "$FILE" target.apk
+            echo "SPLIT_INSTALL=false" >> $GITHUB_ENV
+          fi
+
+      # ==========================================
+      # 2. ANDROID EMULATOR STARTEN
+      # ==========================================
+      - name: 2. Start Android Emulator (Background)
+        run: |
+          echo "🚀 Starting Docker Android Emulator..."
+          docker run -d --privileged -p 5555:5555 -e DEVICE="Samsung Galaxy S10" --name android-container budtmo/docker-android:emulator_13.0
+          
+          adb connect localhost:5555 && adb wait-for-device
+          
+          echo "⏳ Waiting for emulator boot..."
+          while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != "1" ]; do 
+            sleep 2; 
+          done
+          echo "✅ Emulator fully booted."
+
+      # ==========================================
+      # 3. TOOLS INSTALLIEREN & JADX DECOMPILATION
+      # ==========================================
+      - name: 3. Setup Tools & JADX Decompilation
+        run: |
+          sudo apt-get update && sudo apt-get install -y android-tools-adb wget unzip
+          
+          # Java für JADX
+          sudo apt-get install -y openjdk-17-jdk
+          
+          # Node.js für apk-mitm
+          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt-get install -y nodejs
+          npm install -g apk-mitm
+          
+          # Python Tools
+          pip install mitmproxy frida-tools google-generativeai Pillow
+          
+          # JADX herunterladen
+          echo "📥 Downloading JADX..."
+          wget -q https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip -O jadx.zip
+          unzip -q jadx.zip -d jadx
+          chmod +x jadx/bin/jadx
+          
+          # APK patchen
+          echo "🔧 Patching APK for SSL bypass..."
+          apk-mitm target.apk
+          
+          # Frida Server
+          FRIDA_VERSION="16.4.5"
+          wget -q "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-server-${FRIDA_VERSION}-android-x86_64.xz" -O frida-server.xz
+          xz -d frida-server.xz && chmod +x frida-server
+
+      # ==========================================
+      # 4. APK DECOMPILIEREN MIT JADX
+      # ==========================================
+      - name: 4. Decompile APK with JADX
+        run: |
+          echo "🔬 Decompiling APK to Java source code..."
+          ./jadx/bin/jadx -d jadx-output --show-bad-code target.apk
+          echo "✅ Decompilation complete. Found $(find jadx-output -name '*.java' | wc -l) Java files."
+
+      # ==========================================
+      # 5. CA INJEKTION, APP INSTALLIEREN & FRIDA STARTEN
+      # ==========================================
+      - name: 5. Inject CA, Install App & Start Frida
+        run: |
+          adb root && sleep 2 && adb remount
+          
+          # mitmproxy CA generieren
+          nohup mitmdump --listen-port 8080 > /dev/null 2>&1 &
+          sleep 3 && kill $!
+          
+          # CA in den Android System Store injizieren
+          CERT_PATH="$HOME/.mitmproxy/mitmproxy-ca-cert.cer"
+          HASH=$(openssl x509 -inform PEM -subject_hash_old -in $CERT_PATH | head -1)
+          adb push $CERT_PATH /sdcard/${HASH}.0 && adb shell mv /sdcard/${HASH}.0 /system/etc/security/cacerts/
+          adb shell chmod 644 /system/etc/security/cacerts/${HASH}.0
+          
+          # SMART INSTALLATION LOGIC
+          if [ "$SPLIT_INSTALL" = "true" ]; then
+            echo "📲 Installing Split XAPK (Base + Configs)..."
+            BASE_APK=$(find split_apks -name "*.apk" -exec ls -s {} + | sort -n -r | head -1 | awk '{print $2}')
+            cp target.apk "$BASE_APK"
+            adb install-multiple split_apks/*.apk
+          else
+            echo "📲 Installing standard APK..."
+            adb install target.apk
+          fi
+          
+          # Frida Server pushen und starten
+          adb push frida-server /data/local/tmp/frida-server
+          adb shell "chmod 755 /data/local/tmp/frida-server"
+          adb shell "/data/local/tmp/frida-server &"
+          sleep 2
+          echo "✅ Frida server running."
+
+      # ==========================================
+      # 6. TRAFFIC ABFANGEN & KI (GEMINI) STARTEN
+      # ==========================================
+      - name: 6. Intercept Traffic & Run AI Vision Agent
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          PKG="${{ github.event.inputs.package_name }}"
+          HOST_IP=$(ip route get 1.1.1.1 | awk '{print $7}')
+          
+          # mitmproxy starten
+          nohup mitmdump --listen-port 8080 --set block_global=false --dump-flowhar=traffic.har > mitm.log 2>&1 &
+          echo "MITM_PID=$!" >> $GITHUB_ENV
+          
+          # Android Proxy setzen
+          adb shell settings put global http_proxy ${HOST_IP}:8080
+          
+          # App mit Frida starten
+          echo "🕵️ Spawning app with Frida..."
+          nohup frida -U -f $PKG -l bypass.js --no-pause > frida.log 2>&1 &
+          echo "FRIDA_PID=$!" >> $GITHUB_ENV
+          
+          sleep 5
+          
+          echo "🤖 Handing control over to AI Vision Agent (Gemini)..."
+          python ai_agent.py
+
+      # ==========================================
+      # 7. TRAFFIC PARAMETER EXTRAKTION
+      # ==========================================
+      - name: 7. Extract Traffic Parameters
+        run: |
+          echo "🔍 Analyzing captured traffic..."
+          python extract_params.py
+
+      # ==========================================
+      # 8. CRYPTO LOGIC ANALYSE
+      # ==========================================
+      - name: 8. Analyze Crypto Logic in Decompiled Code
+        run: |
+          echo "🔐 Analyzing crypto logic in decompiled code..."
+          python analyze_crypto_logic.py
+
+      # ==========================================
+      # 9. CLEANUP
+      # ==========================================
+      - name: 9. Cleanup
+        if: always()
+        run: |
+          adb shell settings put global http_proxy :0 || true
+          kill ${{ env.MITM_PID }} || true
+          kill ${{ env.FRIDA_PID }} || true
+          docker stop android-container || true && docker rm android-container || true
+
+      # ==========================================
+      # 10. ALLE ERGEBNISSE HOCHLADEN
+      # ==========================================
+      - name: Upload Network Traffic (HAR)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-traffic-har
+          path: traffic.har
+
+      - name: Upload Traffic Parameters Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: traffic-parameters-report
+          path: |
+            login_params_report.md
+            login_params.json
+
+      - name: Upload Crypto Logic Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-logic-report
+          path: |
+            crypto_logic_report.md
+            crypto_logic.json
+
+      - name: Upload Decompiled Source Code
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decompiled-source
+          path: jadx-output/
+
+      - name: Upload Debug Logs (If Failed)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-logs
+          path: |
+            mitm.log
+            frida.log
