@@ -1,246 +1,310 @@
-name: AI Vision APK Traffic Extraction with Crypto Analysis
+name: Generic APK AI Traffic Capture & Crypto Analysis
 
 on:
   workflow_dispatch:
     inputs:
-      package_name:
-        description: com.boosteroid.streaming
+      apk_path:
+        description: 'Pfad der APK im Repo (z.B. target.apk)'
         required: true
-        type: string
+        default: 'target.apk'
+      package_name:
+        description: 'Package-Name der App (z.B. com.example.app)'
+        required: true
+        default: 'com.example.app'
+      test_email:
+        description: 'Test-E-Mail für den Login'
+        required: true
+        default: 'testuser@gmail.com'
+      test_password:
+        description: 'Test-Passwort für den Login'
+        required: true
+        default: 'SecurePassword123!'
+
+env:
+  APK_PATH: ${{ github.event.inputs.apk_path }}
+  PACKAGE: ${{ github.event.inputs.package_name }}
+  TEST_EMAIL: ${{ github.event.inputs.test_email }}
+  TEST_PASSWORD: ${{ github.event.inputs.test_password }}
 
 jobs:
-  ai-intercept:
+  ai-capture-and-analyze:
+    # WICHTIG: Benötigt einen Self-Hosted Runner mit /dev/kvm und Docker!
     runs-on: self-hosted
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          lfs: true
 
-      # ==========================================
-      # 1. APK FINDEN & EXTRAHIEREN
-      # ==========================================
-      - name: 1. Find and Extract APK (XAPK/APKM Ready)
+      - name: Install System Dependencies
         run: |
-          FILE=$(find . -type f \( -name "*.apk" -o -name "*.xapk" -o -name "*.apkm" \) | head -n 1)
-          if [ -z "$FILE" ]; then 
-            echo "::error::❌ No APK, XAPK, or APKM file found in the repository."
-            exit 1 
-          fi
-          
-          echo "✅ Found package: $FILE"
-          
-          if [[ "$FILE" == *.xapk ]] || [[ "$FILE" == *.apkm ]]; then
-            echo "📦 Detected archive format. Extracting..."
-            mkdir -p pkg_extract
-            unzip -q "$FILE" -d pkg_extract
-            
-            APK_COUNT=$(find pkg_extract -name "*.apk" | wc -l)
-            
-            if [ "$APK_COUNT" -gt 1 ]; then
-              echo "📦 Found $APK_COUNT split APKs. Preparing for install-multiple..."
-              mkdir -p split_apks
-              find pkg_extract -name "*.apk" -exec cp {} split_apks/ \;
-              echo "SPLIT_INSTALL=true" >> $GITHUB_ENV
-              
-              BASE_APK=$(find split_apks -name "*.apk" -exec ls -s {} + | sort -n -r | head -1 | awk '{print $2}')
-              cp "$BASE_APK" target.apk
-            else
-              echo "📦 Found single APK inside archive."
-              cp $(find pkg_extract -name "*.apk" | head -n 1) target.apk
-              echo "SPLIT_INSTALL=false" >> $GITHUB_ENV
-            fi
-          else
-            cp "$FILE" target.apk
-            echo "SPLIT_INSTALL=false" >> $GITHUB_ENV
-          fi
+          sudo apt-get update
+          sudo apt-get install -y android-tools-adb python3-pip openssl unzip curl jq openjdk-17-jdk
 
-      # ==========================================
-      # 2. ANDROID EMULATOR STARTEN
-      # ==========================================
-      - name: 2. Start Android Emulator (Background)
+      - name: Setup Docker Network & Emulator
         run: |
-          echo "🚀 Starting Docker Android Emulator..."
-          docker run -d --privileged -p 5555:5555 -e DEVICE="Samsung Galaxy S10" --name android-container budtmo/docker-android:emulator_13.0
+          docker network create analysis-net 2>/dev/null || true
           
-          adb connect localhost:5555 && adb wait-for-device
-          
-          echo "⏳ Waiting for emulator boot..."
+          # Wir nutzen budtmo/docker-android, da dies stabiler ist als rohes redroid auf CI-Systemen
+          echo "🚀 Starting Android Emulator..."
+          docker run -d --name android-emulator --privileged \
+            --network analysis-net \
+            -p 5555:5555 \
+            -e DEVICE="Samsung Galaxy S10" \
+            budtmo/docker-android:emulator_13.0
+
+          # Warten bis ADB verfügbar ist
+          adb connect localhost:5555
+          adb wait-for-device
+          echo "⏳ Waiting for boot completion..."
           while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != "1" ]; do 
-            sleep 2; 
+            sleep 3
           done
-          echo "✅ Emulator fully booted."
+          echo "✅ Emulator booted."
+          
+          EMULATOR_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' android-emulator)
+          echo "EMULATOR_IP=${EMULATOR_IP}" >> $GITHUB_ENV
+          echo "TARGET_DEVICE=${EMULATOR_IP}:5555" >> $GITHUB_ENV
 
-      # ==========================================
-      # 3. TOOLS INSTALLIEREN & JADX DECOMPILATION
-      # ==========================================
-      - name: 3. Setup Tools & JADX Decompilation
+      - name: Setup mitmproxy
         run: |
-          sudo apt-get update && sudo apt-get install -y android-tools-adb wget unzip
+          mkdir -p mitm_out
+          docker run -d --name mitmproxy --network analysis-net \
+            -v "$PWD/mitm_out:/home/mitmproxy/out" \
+            mitmproxy/mitmproxy:latest \
+            mitmdump -w /home/mitmproxy/out/flows.mitm \
+              --listen-port 8080 \
+              --ssl-insecure \
+              --set block_global=false \
+              --set confdir=/home/mitmproxy/.mitmproxy
           
-          # Java für JADX
-          sudo apt-get install -y openjdk-17-jdk
+          # Warten bis das Zertifikat generiert ist
+          for i in $(seq 1 30); do
+            if docker exec mitmproxy test -f /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install CA Certificate into Android
+        run: |
+          docker exec mitmproxy cat /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem > cacert.pem
+          HASH=$(openssl x509 -subject_hash_old -in cacert.pem | head -n1)
           
-          # Node.js für apk-mitm
-          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt-get install -y nodejs
-          npm install -g apk-mitm
+          adb -s "$TARGET_DEVICE" root
+          sleep 2
+          adb -s "$TARGET_DEVICE" remount
+          adb -s "$TARGET_DEVICE" shell mkdir -p /system/etc/security/cacerts
+          adb -s "$TARGET_DEVICE" push cacert.pem "/system/etc/security/cacerts/${HASH}.0"
+          adb -s "$TARGET_DEVICE" shell chmod 644 "/system/etc/security/cacerts/${HASH}.0"
           
-          # Python Tools
-          pip install mitmproxy frida-tools google-generativeai Pillow
+          # Proxy setzen
+          MITM_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' mitmproxy)
+          adb -s "$TARGET_DEVICE" shell settings put global http_proxy "${MITM_IP}:8080"
+
+      - name: Install Frida & APK
+        run: |
+          FRIDA_VERSION=$(curl -s https://api.github.com/repos/frida/frida/releases/latest | jq -r .tag_name)
+          curl -L -o frida-server.xz "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-server-${FRIDA_VERSION}-android-x86_64.xz"
+          unxz -f frida-server.xz
+          chmod +x frida-server
+
+          adb -s "$TARGET_DEVICE" push frida-server /data/local/tmp/
+          adb -s "$TARGET_DEVICE" shell "chmod 755 /data/local/tmp/frida-server"
+          adb -s "$TARGET_DEVICE" shell "nohup /data/local/tmp/frida-server > /data/local/tmp/frida.log 2>&1 &"
+          sleep 3
+
+          # APK installieren
+          if [ -f "${{ env.APK_PATH }}" ]; then
+            adb -s "$TARGET_DEVICE" install -r -g "${{ env.APK_PATH }}" || {
+              adb -s "$TARGET_DEVICE" push "${{ env.APK_PATH }}" /data/local/tmp/app.apk
+              adb -s "$TARGET_DEVICE" shell pm install -r -d -t -g /data/local/tmp/app.apk
+            }
+          else
+            echo "::error::APK nicht gefunden unter ${{ env.APK_PATH }}"
+            exit 1
+          fi
+
+      - name: Create Universal SSL-Pinning Bypass Hook
+        run: |
+          cat > universal_ssl_bypass.js << 'EOF'
+          Java.perform(function () {
+              console.log("\n⚡ === UNIVERSAL SSL-PINNING BYPASS ACTIVE === ⚡");
+              try {
+                  var TMI = Java.use('com.android.org.conscrypt.TrustManagerImpl');
+                  TMI.checkTrustedRecursive.implementation = function () {
+                      return Java.use("java.util.ArrayList").$new();
+                  };
+              } catch (e) {}
+              
+              try {
+                  var CP = Java.use('okhttp3.CertificatePinner');
+                  CP.check.overload('java.lang.String', 'java.util.List').implementation = function() {};
+              } catch (e) {}
+          });
+          EOF
+
+      - name: AI-Powered Heuristic UI Navigator & Login Agent
+        run: |
+          nohup frida -D "$TARGET_DEVICE" -f "$PACKAGE" -l universal_ssl_bypass.js -o frida_output.log > frida_stdout.log 2>&1 &
+          FRIDA_PID=$!
+          sleep 15 # Warten bis die App geladen ist
+
+          cat > ai_agent.py << 'PYEOF'
+          import sys, time, re, os
+          import xml.etree.ElementTree as ET
+          import subprocess
+
+          SERIAL = os.environ["TARGET_DEVICE"]
+          PACKAGE = os.environ["PACKAGE"]
+          EMAIL = os.environ["TEST_EMAIL"]
+          PASSWORD = os.environ["TEST_PASSWORD"]
+          ADB = ["adb", "-s", SERIAL]
+
+          LOGIN_KEYWORDS = ["log in", "login", "signin", "sign in", "anmelden", "einloggen", "continue", "weiter", "next", "start"]
+          EMAIL_KEYWORDS = ["email", "e-mail", "mail", "user", "username", "benutzer", "telefon", "phone", "konto"]
+          PASSWORD_KEYWORDS = ["password", "passwort", "pwd", "secret", "pin"]
+
+          def sh(args):
+              return subprocess.run(ADB + args, capture_output=True, text=True)
+
+          def dump_ui():
+              sh(["shell", "rm", "-f", "/sdcard/ui.xml"])
+              sh(["shell", "uiautomator", "dump", "/sdcard/ui.xml"])
+              sh(["pull", "/sdcard/ui.xml", "ui.xml"])
+              try:
+                  return ET.parse("ui.xml")
+              except Exception:
+                  return None
+
+          def evaluate_nodes(tree):
+              best_action = None
+              highest_score = -1
+
+              for node in tree.iter("node"):
+                  text = (node.get("text") or "").strip().lower()
+                  desc = (node.get("content-desc") or "").strip().lower()
+                  res_id = (node.get("resource-id") or "").strip().lower()
+                  cls = node.get("class", "").lower()
+                  clickable = node.get("clickable") == "true"
+                  
+                  combined_text = f"{text} {desc} {res_id}"
+                  score = 0
+                  action_type = "click"
+                  payload = ""
+
+                  if "edittext" in cls:
+                      if any(k in combined_text for k in PASSWORD_KEYWORDS):
+                          score += 100
+                          action_type = "password"
+                          payload = PASSWORD
+                      elif any(k in combined_text for k in EMAIL_KEYWORDS) or score == 0:
+                          score += 80
+                          action_type = "email"
+                          payload = EMAIL
+                  elif clickable or "button" in cls or "textview" in cls:
+                      if any(k in combined_text for k in LOGIN_KEYWORDS):
+                          score += 90
+                          action_type = "click"
+
+                  if score > highest_score:
+                      bounds = node.get("bounds")
+                      m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+                      if m:
+                          x1, y1, x2, y2 = map(int, m.groups())
+                          if x2 > x1 and y2 > y1:
+                              cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                              highest_score = score
+                              best_action = (action_type, cx, cy, combined_text, payload)
+
+              return best_action
+
+          print("[KI-AGENT] Starte App...")
+          sh(["shell", "am", "force-stop", PACKAGE])
+          time.sleep(2)
+          sh(["shell", "monkey", "-p", PACKAGE, "1"])
+
+          interacted_coords = set()
+          for step in range(12): # 12 Schritte für Splash-Screen + Login
+              time.sleep(3)
+              tree = dump_ui()
+              if tree is None:
+                  continue
+
+              action = evaluate_nodes(tree)
+              if action:
+                  action_type, x, y, context, payload = action
+                  
+                  if (x, y) in interacted_coords and action_type == "click":
+                      print(f"[KI-AGENT] Element bei ({x}, {y}) bereits geklickt, überspringe...")
+                      continue
+
+                  print(f"[KI-AGENT] Step {step}: Führe '{action_type}' aus bei ({x}, {y}) [Kontext: {context}]")
+                  sh(["shell", "input", "tap", str(x), str(y)])
+                  interacted_coords.add((x, y))
+                  time.sleep(1)
+
+                  if action_type in ["email", "password"]:
+                      sh(["shell", "input", "text", payload])
+                      sh(["shell", "input", "keyevent", "66"]) # Enter
+                  
+                  time.sleep(2)
+              else:
+                  print(f"[KI-AGENT] Step {step}: Warte auf UI-Elemente...")
           
-          # JADX herunterladen
-          echo "📥 Downloading JADX..."
+          print("[KI-AGENT] Login-Sequenz abgeschlossen. Warte auf Netzwerk-Requests...")
+          time.sleep(5)
+          PYEOF
+
+          python3 ai_agent.py
+          kill $FRIDA_PID 2>/dev/null || true
+
+      - name: Export Network Traffic
+        run: |
+          echo "📦 Exportiere Netzwerk-Traffic..."
+          if [ -f "mitm_out/flows.mitm" ]; then
+            mitmdump -n -r mitm_out/flows.mitm --flow-detail 3 > traffic_complete.txt || true
+          else
+            echo "Kein Traffic aufgezeichnet." > traffic_complete.txt
+          fi
+
+      - name: Decompile APK for Crypto Analysis
+        run: |
+          echo "🔬 Decompiliere APK für Crypto-Analyse..."
           wget -q https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip -O jadx.zip
           unzip -q jadx.zip -d jadx
           chmod +x jadx/bin/jadx
-          
-          # APK patchen
-          echo "🔧 Patching APK for SSL bypass..."
-          apk-mitm target.apk
-          
-          # Frida Server
-          FRIDA_VERSION="16.4.5"
-          wget -q "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-server-${FRIDA_VERSION}-android-x86_64.xz" -O frida-server.xz
-          xz -d frida-server.xz && chmod +x frida-server
+          ./jadx/bin/jadx -d jadx-output --show-bad-code "${{ env.APK_PATH }}"
 
-      # ==========================================
-      # 4. APK DECOMPILIEREN MIT JADX
-      # ==========================================
-      - name: 4. Decompile APK with JADX
+      - name: Run Crypto Logic Analyzer
         run: |
-          echo "🔬 Decompiling APK to Java source code..."
-          ./jadx/bin/jadx -d jadx-output --show-bad-code target.apk
-          echo "✅ Decompilation complete. Found $(find jadx-output -name '*.java' | wc -l) Java files."
-
-      # ==========================================
-      # 5. CA INJEKTION, APP INSTALLIEREN & FRIDA STARTEN
-      # ==========================================
-      - name: 5. Inject CA, Install App & Start Frida
-        run: |
-          adb root && sleep 2 && adb remount
-          
-          # mitmproxy CA generieren
-          nohup mitmdump --listen-port 8080 > /dev/null 2>&1 &
-          sleep 3 && kill $!
-          
-          # CA in den Android System Store injizieren
-          CERT_PATH="$HOME/.mitmproxy/mitmproxy-ca-cert.cer"
-          HASH=$(openssl x509 -inform PEM -subject_hash_old -in $CERT_PATH | head -1)
-          adb push $CERT_PATH /sdcard/${HASH}.0 && adb shell mv /sdcard/${HASH}.0 /system/etc/security/cacerts/
-          adb shell chmod 644 /system/etc/security/cacerts/${HASH}.0
-          
-          # SMART INSTALLATION LOGIC
-          if [ "$SPLIT_INSTALL" = "true" ]; then
-            echo "📲 Installing Split XAPK (Base + Configs)..."
-            BASE_APK=$(find split_apks -name "*.apk" -exec ls -s {} + | sort -n -r | head -1 | awk '{print $2}')
-            cp target.apk "$BASE_APK"
-            adb install-multiple split_apks/*.apk
+          # Wir nutzen das analyze_crypto_logic.py Skript aus dem vorherigen Schritt
+          # Stelle sicher, dass diese Datei im Root deines Repos liegt!
+          if [ -f "analyze_crypto_logic.py" ]; then
+            python3 analyze_crypto_logic.py
           else
-            echo "📲 Installing standard APK..."
-            adb install target.apk
+            echo "analyze_crypto_logic.py nicht gefunden. Überspringe Crypto-Analyse."
           fi
-          
-          # Frida Server pushen und starten
-          adb push frida-server /data/local/tmp/frida-server
-          adb shell "chmod 755 /data/local/tmp/frida-server"
-          adb shell "/data/local/tmp/frida-server &"
-          sleep 2
-          echo "✅ Frida server running."
 
-      # ==========================================
-      # 6. TRAFFIC ABFANGEN & KI (GEMINI) STARTEN
-      # ==========================================
-      - name: 6. Intercept Traffic & Run AI Vision Agent
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          PKG="${{ github.event.inputs.package_name }}"
-          HOST_IP=$(ip route get 1.1.1.1 | awk '{print $7}')
-          
-          # mitmproxy starten
-          nohup mitmdump --listen-port 8080 --set block_global=false --dump-flowhar=traffic.har > mitm.log 2>&1 &
-          echo "MITM_PID=$!" >> $GITHUB_ENV
-          
-          # Android Proxy setzen
-          adb shell settings put global http_proxy ${HOST_IP}:8080
-          
-          # App mit Frida starten
-          echo "🕵️ Spawning app with Frida..."
-          nohup frida -U -f $PKG -l bypass.js --no-pause > frida.log 2>&1 &
-          echo "FRIDA_PID=$!" >> $GITHUB_ENV
-          
-          sleep 5
-          
-          echo "🤖 Handing control over to AI Vision Agent (Gemini)..."
-          python ai_agent.py
-
-      # ==========================================
-      # 7. TRAFFIC PARAMETER EXTRAKTION
-      # ==========================================
-      - name: 7. Extract Traffic Parameters
-        run: |
-          echo "🔍 Analyzing captured traffic..."
-          python extract_params.py
-
-      # ==========================================
-      # 8. CRYPTO LOGIC ANALYSE
-      # ==========================================
-      - name: 8. Analyze Crypto Logic in Decompiled Code
-        run: |
-          echo "🔐 Analyzing crypto logic in decompiled code..."
-          python analyze_crypto_logic.py
-
-      # ==========================================
-      # 9. CLEANUP
-      # ==========================================
-      - name: 9. Cleanup
-        if: always()
-        run: |
-          adb shell settings put global http_proxy :0 || true
-          kill ${{ env.MITM_PID }} || true
-          kill ${{ env.FRIDA_PID }} || true
-          docker stop android-container || true && docker rm android-container || true
-
-      # ==========================================
-      # 10. ALLE ERGEBNISSE HOCHLADEN
-      # ==========================================
-      - name: Upload Network Traffic (HAR)
+      - name: Save Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: network-traffic-har
-          path: traffic.har
-
-      - name: Upload Traffic Parameters Report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: traffic-parameters-report
+          name: app-traffic-and-crypto-analysis
           path: |
-            login_params_report.md
-            login_params.json
-
-      - name: Upload Crypto Logic Report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: crypto-logic-report
-          path: |
+            traffic_complete.txt
+            frida_output.log
             crypto_logic_report.md
             crypto_logic.json
+            jadx-output/
+          if-no-files-found: warn
 
-      - name: Upload Decompiled Source Code
+      - name: Cleanup
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: decompiled-source
-          path: jadx-output/
-
-      - name: Upload Debug Logs (If Failed)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-logs
-          path: |
-            mitm.log
-            frida.log
+        run: |
+          adb -s "$TARGET_DEVICE" shell settings put global http_proxy :0 || true
+          docker stop android-emulator mitmproxy 2>/dev/null || true
+          docker rm android-emulator mitmproxy 2>/dev/null || true
+          docker network rm analysis-net 2>/dev/null || true
