@@ -7,10 +7,10 @@ import sys
 from PIL import Image
 import google.generativeai as genai
 
-# Initialize Gemini Client (Uses the API key from GitHub Secrets)
+# Initialize Gemini Client
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
-# gemini-2.0-flash is extremely fast and has excellent vision/spatial reasoning
+# gemini-2.0-flash is extremely fast
 model = genai.GenerativeModel("gemini-2.0-flash")
 
 def run_cmd(cmd):
@@ -26,17 +26,14 @@ def ask_ai(prompt, max_retries=3):
     img = take_screenshot()
     for i in range(max_retries):
         try:
-            # Force Gemini to return strict JSON
             response = model.generate_content(
                 [prompt, img],
                 generation_config=genai.GenerationConfig(
                     response_mime_type="application/json"
                 )
             )
-            # Parse the JSON response
             data = json.loads(response.text)
             box = data['box']
-            # Calculate the center of the bounding box to tap
             x = (box[0] + box[2]) // 2
             y = (box[1] + box[3]) // 2
             return x, y
@@ -50,10 +47,8 @@ def tap(x, y):
     run_cmd(f"adb shell input tap {x} {y}")
 
 def type_text(text):
-    # ADB input text requires escaping spaces. 
     text = text.replace(" ", "%s")
     run_cmd(f"adb shell input text '{text}'")
-    # Hide the keyboard so it doesn't block the next element
     run_cmd("adb shell input keyevent 111") 
 
 def check_success():
@@ -85,7 +80,6 @@ print("👁️ Looking for Password field...")
 x, y = ask_ai("Find the bounding box of the Password input field. Return JSON: {\"box\": [x1, y1, x2, y2]}")
 tap(x, y)
 time.sleep(1)
-# Using a simple alphanumeric password to avoid ADB input text special character bugs
 type_text("TestPassword123") 
 
 # 3. Find and tap Login Button
